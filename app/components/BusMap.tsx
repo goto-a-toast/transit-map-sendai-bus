@@ -5,8 +5,9 @@ import type { BusVehicle } from '../api/buses/route';
 
 const SENDAI_CENTER: [number, number] = [38.2682, 140.8694];
 const REFRESH_INTERVAL = 15; // seconds
-const LERP_DURATION   = 2500; // ms — snap-to-new-position animation
-const DR_CAP_SEC      = 25;   // dead-reckoning cap (stop extrapolating after this many seconds)
+const LERP_DURATION   = 1500; // ms — snap-to-new-position animation
+const DR_CAP_SEC      = 20;   // dead-reckoning cap (stop extrapolating after this many seconds)
+const DR_SPEED_FACTOR = 0.65; // scale down speed to account for road curvature & measurement noise
 
 let L: typeof import('leaflet') | null = null;
 
@@ -25,9 +26,9 @@ function deadReckon(
   bearingDeg: number, speedMs: number,
   elapsedSec: number,
 ): [number, number] {
-  const t   = Math.min(elapsedSec, DR_CAP_SEC);
+  const t    = Math.min(elapsedSec, DR_CAP_SEC);
   const bRad = toRad(bearingDeg);
-  const dist = speedMs * t; // metres travelled
+  const dist = speedMs * DR_SPEED_FACTOR * t; // metres travelled (damped)
   const dlat = (dist * Math.cos(bRad)) / 111_111;
   const dlng = (dist * Math.sin(bRad)) / (111_111 * Math.cos(toRad(anchorLat)));
   return [anchorLat + dlat, anchorLng + dlng];
