@@ -5,28 +5,49 @@ import type { BusVehicle } from '../api/buses/route';
 
 const SENDAI_CENTER: [number, number] = [38.2682, 140.8694];
 const REFRESH_INTERVAL = 30; // seconds
-const ANIM_DURATION = 3000; // ms — position lerp duration
+const LERP_DURATION   = 2500; // ms — snap-to-new-position animation
+const DR_CAP_SEC      = 45;   // dead-reckoning cap (stop extrapolating after this many seconds)
 
 let L: typeof import('leaflet') | null = null;
 
-// ── animation helpers ──────────────────────────────────────────────────────
-function easeOutCubic(t: number): number {
-  return 1 - Math.pow(1 - t, 3);
-}
-function lerp(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
-}
+// ── math helpers ───────────────────────────────────────────────────────────
+function easeOutCubic(t: number): number { return 1 - Math.pow(1 - t, 3); }
+function lerp(a: number, b: number, t: number): number { return a + (b - a) * t; }
 function lerpAngle(a: number, b: number, t: number): number {
-  // shortest-path interpolation on a circle
-  let diff = ((b - a + 540) % 360) - 180;
+  const diff = ((b - a + 540) % 360) - 180;
   return (a + diff * t + 360) % 360;
 }
+function toRad(deg: number): number { return (deg * Math.PI) / 180; }
 
-interface AnimTask {
+/** Extrapolate lat/lng from an anchor using constant speed + bearing */
+function deadReckon(
+  anchorLat: number, anchorLng: number,
+  bearingDeg: number, speedMs: number,
+  elapsedSec: number,
+): [number, number] {
+  const t   = Math.min(elapsedSec, DR_CAP_SEC);
+  const bRad = toRad(bearingDeg);
+  const dist = speedMs * t; // metres travelled
+  const dlat = (dist * Math.cos(bRad)) / 111_111;
+  const dlng = (dist * Math.sin(bRad)) / (111_111 * Math.cos(toRad(anchorLat)));
+  return [anchorLat + dlat, anchorLng + dlng];
+}
+
+// ── per-bus state ──────────────────────────────────────────────────────────
+interface LerpTask {
   fromLat: number; fromLng: number;
-  toLat: number;   toLng: number;
+  toLat:   number; toLng:   number;
   fromBearing: number; toBearing: number;
   startTime: number;
+}
+
+/** Dead-reckoning anchor — set once lerp ends (or on first appearance) */
+interface DrAnchor {
+  lat: number; lng: number;
+  bearingDeg: number;
+  speedMs: number;
+  time: number;          // performance.now()
+  routeId?: string;
 }
 
 // ── icon factory ───────────────────────────────────────────────────────────
@@ -38,7 +59,6 @@ function getBusIcon(
   const hue = routeId
     ? Math.abs(routeId.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0)) % 360
     : 210;
-
   const svg = `
     <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
       <defs>
@@ -46,25 +66,16 @@ function getBusIcon(
           <feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.35"/>
         </filter>
       </defs>
-      <!-- direction arrow (rotates with bearing) -->
-      <g transform="rotate(${bearing}, 16, 16)" filter="url(#sh)">
+      <g transform="rotate(${bearing},16,16)" filter="url(#sh)">
         <polygon points="16,3 20,11 12,11" fill="hsl(${hue},85%,38%)"/>
       </g>
-      <!-- bus body -->
       <rect x="8" y="11" width="16" height="13" rx="2.5" fill="hsl(${hue},72%,48%)" filter="url(#sh)"/>
-      <rect x="10" y="13" width="5"  height="3.5" rx="1" fill="white" opacity="0.95"/>
-      <rect x="17" y="13" width="5"  height="3.5" rx="1" fill="white" opacity="0.95"/>
+      <rect x="10" y="13" width="5" height="3.5" rx="1" fill="white" opacity="0.95"/>
+      <rect x="17" y="13" width="5" height="3.5" rx="1" fill="white" opacity="0.95"/>
       <rect x="9"  y="23" width="3.5" height="2.5" rx="1" fill="hsl(${hue},60%,28%)"/>
       <rect x="19.5" y="23" width="3.5" height="2.5" rx="1" fill="hsl(${hue},60%,28%)"/>
     </svg>`;
-
-  return lf.divIcon({
-    html: svg,
-    className: '',
-    iconSize: [32, 32],
-    iconAnchor: [16, 16],
-    popupAnchor: [0, -18],
-  });
+  return lf.divIcon({ html: svg, className: '', iconSize: [32,32], iconAnchor: [16,16], popupAnchor: [0,-18] });
 }
 
 // ── popup ──────────────────────────────────────────────────────────────────
@@ -72,26 +83,21 @@ function formatTime(ts?: number): string {
   if (!ts) return '-';
   return new Date(ts).toLocaleTimeString('ja-JP');
 }
-
 function buildPopup(bus: BusVehicle): string {
   const rows: [string, string][] = [
     ['車両', bus.vehicleLabel ?? bus.id],
     ['路線', bus.routeId ?? '-'],
-    ['便', bus.tripId ?? '-'],
-    ['速度', bus.speed != null ? `${bus.speed} km/h` : '-'],
+    ['便',   bus.tripId  ?? '-'],
+    ['速度', bus.speed   != null ? `${bus.speed} km/h` : '-'],
     ['方位', bus.bearing != null ? `${Math.round(bus.bearing)}°` : '-'],
     ['状態', bus.currentStatus ?? '-'],
     ['更新', formatTime(bus.timestamp)],
   ];
-  const rowsHtml = rows
-    .map(
-      ([l, v]) =>
-        `<tr>
-          <td style="color:#6b7280;padding:2px 10px 2px 0;font-size:11px;white-space:nowrap">${l}</td>
-          <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
-        </tr>`,
-    )
-    .join('');
+  const rowsHtml = rows.map(([l,v]) => `
+    <tr>
+      <td style="color:#6b7280;padding:2px 10px 2px 0;font-size:11px;white-space:nowrap">${l}</td>
+      <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
+    </tr>`).join('');
   return `
     <div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:180px;
                 font-family:system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.15)">
@@ -101,62 +107,77 @@ function buildPopup(bus: BusVehicle): string {
 }
 
 // ── component ──────────────────────────────────────────────────────────────
-interface FetchResult {
-  vehicles: BusVehicle[];
-  count: number;
-  fetchedAt: number;
-  error?: string;
-}
+interface FetchResult { vehicles: BusVehicle[]; count: number; fetchedAt: number; error?: string; }
 
 export default function BusMap() {
-  const mapRef        = useRef<import('leaflet').Map | null>(null);
-  const markersRef    = useRef<Map<string, import('leaflet').Marker>>(new Map());
-  const bearingsRef   = useRef<Map<string, number>>(new Map()); // current rendered bearing
-  const containerRef  = useRef<HTMLDivElement>(null);
-  const animTasksRef  = useRef<Map<string, AnimTask>>(new Map());
-  const rafRef        = useRef<number | null>(null);
+  const mapRef       = useRef<import('leaflet').Map | null>(null);
+  const markersRef   = useRef<Map<string, import('leaflet').Marker>>(new Map());
+  const bearingsRef  = useRef<Map<string, number>>(new Map());
+  const containerRef = useRef<HTMLDivElement>(null);
 
-  const [status,     setStatus]     = useState<'loading' | 'ok' | 'error'>('loading');
+  // lerp tasks: position snap when new API data arrives
+  const lerpTasksRef = useRef<Map<string, LerpTask>>(new Map());
+  // dead-reckoning anchors: continuous movement between updates
+  const drRef        = useRef<Map<string, DrAnchor>>(new Map());
+  const rafRef       = useRef<number | null>(null);
+
+  const [status,     setStatus]     = useState<'loading'|'ok'|'error'>('loading');
   const [busCount,   setBusCount]   = useState(0);
   const [lastUpdate, setLastUpdate] = useState('');
   const [errorMsg,   setErrorMsg]   = useState('');
   const [countdown,  setCountdown]  = useState(REFRESH_INTERVAL);
   const countdownRef = useRef(REFRESH_INTERVAL);
-  const timerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timerRef     = useRef<ReturnType<typeof setTimeout>|null>(null);
 
-  // ── RAF animation loop ──────────────────────────────────────────────────
+  // ── unified RAF loop ────────────────────────────────────────────────────
   const startRaf = useCallback(() => {
     if (rafRef.current != null) return;
 
     const loop = () => {
-      const now  = performance.now();
-      let active = false;
+      const now = performance.now();
+      let needsNextFrame = false;
 
-      for (const [id, task] of animTasksRef.current) {
-        const t = Math.min((now - task.startTime) / ANIM_DURATION, 1);
+      // 1. Lerp tasks: snap to new reported position
+      for (const [id, task] of lerpTasksRef.current) {
+        const t = Math.min((now - task.startTime) / LERP_DURATION, 1);
         const e = easeOutCubic(t);
 
         const marker = markersRef.current.get(id);
         if (marker && L) {
-          // interpolate position
-          const lat = lerp(task.fromLat, task.toLat, e);
-          const lng = lerp(task.fromLng, task.toLng, e);
-          marker.setLatLng([lat, lng]);
-
-          // interpolate bearing and redraw icon
+          marker.setLatLng([lerp(task.fromLat, task.toLat, e), lerp(task.fromLng, task.toLng, e)]);
           const bearing = lerpAngle(task.fromBearing, task.toBearing, e);
           bearingsRef.current.set(id, bearing);
-          marker.setIcon(getBusIcon(L, bearing, undefined /* keep colour */));
+          marker.setIcon(getBusIcon(L, bearing, drRef.current.get(id)?.routeId));
         }
 
         if (t < 1) {
-          active = true;
+          needsNextFrame = true;
         } else {
-          animTasksRef.current.delete(id);
+          lerpTasksRef.current.delete(id);
+          // Lerp done → set dead-reckoning anchor from the arrived position
+          const dr = drRef.current.get(id);
+          if (dr) {
+            dr.lat  = task.toLat;
+            dr.lng  = task.toLng;
+            dr.time = now;
+          }
         }
       }
 
-      rafRef.current = active ? requestAnimationFrame(loop) : null;
+      // 2. Dead reckoning: extrapolate movement for non-lerping buses
+      for (const [id, dr] of drRef.current) {
+        if (lerpTasksRef.current.has(id)) continue; // lerp has priority
+        if (dr.speedMs <= 0) continue;
+
+        const elapsed = (now - dr.time) / 1000;
+        if (elapsed >= DR_CAP_SEC) continue; // stop extrapolating after cap
+
+        const [lat, lng] = deadReckon(dr.lat, dr.lng, dr.bearingDeg, dr.speedMs, elapsed);
+        markersRef.current.get(id)?.setLatLng([lat, lng]);
+        needsNextFrame = true;
+      }
+
+      rafRef.current = needsNextFrame ? requestAnimationFrame(loop) : null;
     };
 
     rafRef.current = requestAnimationFrame(loop);
@@ -168,29 +189,32 @@ export default function BusMap() {
     try {
       const res  = await fetch('/api/buses', { cache: 'no-store' });
       const data: FetchResult = await res.json();
+      if (!res.ok || data.error) { setStatus('error'); setErrorMsg(data.error ?? 'エラー'); return; }
 
-      if (!res.ok || data.error) {
-        setStatus('error');
-        setErrorMsg(data.error ?? 'エラーが発生しました');
-        return;
-      }
-
-      const map = mapRef.current;
-      const lf  = L;
+      const lf = L;
       const existingIds = new Set(markersRef.current.keys());
 
       for (const bus of data.vehicles) {
         const newBearing = bus.bearing ?? 0;
-        const icon       = getBusIcon(lf, newBearing, bus.routeId);
+        const newSpeedMs = (bus.speed ?? 0) / 3.6;
         const popup      = buildPopup(bus);
 
         if (markersRef.current.has(bus.id)) {
-          const marker     = markersRef.current.get(bus.id)!;
-          const cur        = marker.getLatLng();
+          const marker      = markersRef.current.get(bus.id)!;
+          const cur         = marker.getLatLng(); // current visual pos (may be dead-reckoned)
           const fromBearing = bearingsRef.current.get(bus.id) ?? newBearing;
 
-          // register animation task (position + bearing)
-          animTasksRef.current.set(bus.id, {
+          // Update DR state with new speed/bearing (anchor will be set when lerp ends)
+          drRef.current.set(bus.id, {
+            lat: bus.lat, lng: bus.lon,       // target reported position
+            bearingDeg: newBearing,
+            speedMs:    newSpeedMs,
+            time:       performance.now(),    // overridden when lerp ends
+            routeId:    bus.routeId,
+          });
+
+          // Lerp from current visual position → new reported position
+          lerpTasksRef.current.set(bus.id, {
             fromLat: cur.lat, fromLng: cur.lng,
             toLat:   bus.lat, toLng:   bus.lon,
             fromBearing, toBearing: newBearing,
@@ -201,21 +225,29 @@ export default function BusMap() {
           existingIds.delete(bus.id);
           startRaf();
         } else {
-          const marker = lf
-            .marker([bus.lat, bus.lon], { icon })
+          // New bus — place immediately, start dead reckoning at once
+          const icon   = getBusIcon(lf, newBearing, bus.routeId);
+          const marker = lf.marker([bus.lat, bus.lon], { icon })
             .bindPopup(popup, { maxWidth: 260 })
-            .addTo(map);
+            .addTo(mapRef.current!);
           markersRef.current.set(bus.id, marker);
           bearingsRef.current.set(bus.id, newBearing);
+          drRef.current.set(bus.id, {
+            lat: bus.lat, lng: bus.lon,
+            bearingDeg: newBearing, speedMs: newSpeedMs,
+            time: performance.now(), routeId: bus.routeId,
+          });
+          if (newSpeedMs > 0) startRaf();
         }
       }
 
-      // remove buses that disappeared
+      // Remove disappeared buses
       for (const oldId of existingIds) {
         markersRef.current.get(oldId)?.remove();
         markersRef.current.delete(oldId);
         bearingsRef.current.delete(oldId);
-        animTasksRef.current.delete(oldId);
+        lerpTasksRef.current.delete(oldId);
+        drRef.current.delete(oldId);
       }
 
       setBusCount(data.count);
@@ -234,21 +266,11 @@ export default function BusMap() {
     (async () => {
       const leaflet = await import('leaflet');
       L = leaflet;
-
-      const map = leaflet.map(containerRef.current!, {
-        center: SENDAI_CENTER,
-        zoom: 13,
-      });
-
-      // Standard OpenStreetMap tiles (light, readable)
-      leaflet
-        .tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-          attribution:
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-          maxZoom: 19,
-        })
-        .addTo(map);
-
+      const map = leaflet.map(containerRef.current!, { center: SENDAI_CENTER, zoom: 13 });
+      leaflet.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+        maxZoom: 19,
+      }).addTo(map);
       mapRef.current = map;
       await fetchBuses();
     })();
@@ -259,10 +281,7 @@ export default function BusMap() {
     const tick = () => {
       countdownRef.current -= 1;
       setCountdown(countdownRef.current);
-      if (countdownRef.current <= 0) {
-        countdownRef.current = REFRESH_INTERVAL;
-        fetchBuses();
-      }
+      if (countdownRef.current <= 0) { countdownRef.current = REFRESH_INTERVAL; fetchBuses(); }
       timerRef.current = setTimeout(tick, 1000);
     };
     timerRef.current = setTimeout(tick, 1000);
@@ -323,8 +342,7 @@ export default function BusMap() {
         >
           <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003
-                 8.003 0 01-15.357-2m15.357 2H15"/>
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
           </svg>
           今すぐ更新
         </button>
@@ -334,8 +352,8 @@ export default function BusMap() {
         </div>
         <div className="bg-white/80 backdrop-blur-sm text-gray-400 text-[10px] rounded-lg px-3
                         py-1.5 shadow border border-gray-100 leading-relaxed">
-          <div>データ: ODPT 仙台市交通局</div>
-          <div>30秒ごとに自動更新</div>
+          <div>データ: ODPT 仙台市交通局 · 30秒更新</div>
+          <div>位置は速度・方位から推算中</div>
         </div>
       </div>
     </div>
