@@ -4,9 +4,9 @@ import { useEffect, useRef, useState, useCallback } from 'react';
 import type { BusVehicle } from '../api/buses/route';
 
 const SENDAI_CENTER: [number, number] = [38.2682, 140.8694];
-const REFRESH_INTERVAL = 30; // seconds
+const REFRESH_INTERVAL = 15; // seconds
 const LERP_DURATION   = 2500; // ms — snap-to-new-position animation
-const DR_CAP_SEC      = 45;   // dead-reckoning cap (stop extrapolating after this many seconds)
+const DR_CAP_SEC      = 25;   // dead-reckoning cap (stop extrapolating after this many seconds)
 
 let L: typeof import('leaflet') | null = null;
 
@@ -352,7 +352,7 @@ export default function BusMap() {
         </div>
         <div className="bg-white/80 backdrop-blur-sm text-gray-400 text-[10px] rounded-lg px-3
                         py-1.5 shadow border border-gray-100 leading-relaxed">
-          <div>データ: ODPT 仙台市交通局 · 30秒更新</div>
+          <div>データ: ODPT 仙台市交通局 · 15秒更新</div>
           <div>位置は速度・方位から推算中</div>
         </div>
       </div>
