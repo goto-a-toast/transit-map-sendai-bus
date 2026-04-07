@@ -5,51 +5,102 @@ import type { BusVehicle } from '../api/buses/route';
 
 const SENDAI_CENTER: [number, number] = [38.2682, 140.8694];
 const REFRESH_INTERVAL = 30; // seconds
+const ANIM_DURATION = 3000; // ms — position lerp duration
 
-// Leaflet をクライアントサイドのみで動的にロード
 let L: typeof import('leaflet') | null = null;
 
-function getBusIcon(lf: typeof import('leaflet'), bearing?: number, routeId?: string): import('leaflet').DivIcon {
+// ── animation helpers ──────────────────────────────────────────────────────
+function easeOutCubic(t: number): number {
+  return 1 - Math.pow(1 - t, 3);
+}
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+function lerpAngle(a: number, b: number, t: number): number {
+  // shortest-path interpolation on a circle
+  let diff = ((b - a + 540) % 360) - 180;
+  return (a + diff * t + 360) % 360;
+}
+
+interface AnimTask {
+  fromLat: number; fromLng: number;
+  toLat: number;   toLng: number;
+  fromBearing: number; toBearing: number;
+  startTime: number;
+}
+
+// ── icon factory ───────────────────────────────────────────────────────────
+function getBusIcon(
+  lf: typeof import('leaflet'),
+  bearing: number,
+  routeId?: string,
+): import('leaflet').DivIcon {
   const hue = routeId
     ? Math.abs(routeId.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0)) % 360
     : 210;
 
-  const rotation = bearing != null ? bearing : 0;
-
   const svg = `
-    <svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 28 28">
+    <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
       <defs>
-        <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
-          <feDropShadow dx="0" dy="1" stdDeviation="1.5" flood-opacity="0.4"/>
+        <filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
+          <feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.35"/>
         </filter>
       </defs>
-      <g transform="rotate(${rotation}, 14, 14)" filter="url(#shadow)">
-        <!-- Direction arrow -->
-        <polygon points="14,2 18,10 10,10" fill="hsl(${hue},80%,40%)" opacity="0.9"/>
+      <!-- direction arrow (rotates with bearing) -->
+      <g transform="rotate(${bearing}, 16, 16)" filter="url(#sh)">
+        <polygon points="16,3 20,11 12,11" fill="hsl(${hue},85%,38%)"/>
       </g>
-      <!-- Bus body -->
-      <rect x="7" y="9" width="14" height="12" rx="2" fill="hsl(${hue},75%,50%)" filter="url(#shadow)"/>
-      <rect x="9" y="11" width="4" height="3" rx="1" fill="white" opacity="0.9"/>
-      <rect x="15" y="11" width="4" height="3" rx="1" fill="white" opacity="0.9"/>
-      <rect x="8" y="20" width="3" height="2" rx="1" fill="hsl(${hue},60%,30%)"/>
-      <rect x="17" y="20" width="3" height="2" rx="1" fill="hsl(${hue},60%,30%)"/>
-    </svg>
-  `;
+      <!-- bus body -->
+      <rect x="8" y="11" width="16" height="13" rx="2.5" fill="hsl(${hue},72%,48%)" filter="url(#sh)"/>
+      <rect x="10" y="13" width="5"  height="3.5" rx="1" fill="white" opacity="0.95"/>
+      <rect x="17" y="13" width="5"  height="3.5" rx="1" fill="white" opacity="0.95"/>
+      <rect x="9"  y="23" width="3.5" height="2.5" rx="1" fill="hsl(${hue},60%,28%)"/>
+      <rect x="19.5" y="23" width="3.5" height="2.5" rx="1" fill="hsl(${hue},60%,28%)"/>
+    </svg>`;
 
   return lf.divIcon({
     html: svg,
     className: '',
-    iconSize: [28, 28],
-    iconAnchor: [14, 14],
-    popupAnchor: [0, -16],
+    iconSize: [32, 32],
+    iconAnchor: [16, 16],
+    popupAnchor: [0, -18],
   });
 }
 
+// ── popup ──────────────────────────────────────────────────────────────────
 function formatTime(ts?: number): string {
   if (!ts) return '-';
   return new Date(ts).toLocaleTimeString('ja-JP');
 }
 
+function buildPopup(bus: BusVehicle): string {
+  const rows: [string, string][] = [
+    ['車両', bus.vehicleLabel ?? bus.id],
+    ['路線', bus.routeId ?? '-'],
+    ['便', bus.tripId ?? '-'],
+    ['速度', bus.speed != null ? `${bus.speed} km/h` : '-'],
+    ['方位', bus.bearing != null ? `${Math.round(bus.bearing)}°` : '-'],
+    ['状態', bus.currentStatus ?? '-'],
+    ['更新', formatTime(bus.timestamp)],
+  ];
+  const rowsHtml = rows
+    .map(
+      ([l, v]) =>
+        `<tr>
+          <td style="color:#6b7280;padding:2px 10px 2px 0;font-size:11px;white-space:nowrap">${l}</td>
+          <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
+        </tr>`,
+    )
+    .join('');
+  return `
+    <div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:180px;
+                font-family:system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.15)">
+      <div style="font-weight:700;font-size:13px;margin-bottom:7px;color:#2563eb">🚌 バス情報</div>
+      <table style="border-collapse:collapse;width:100%">${rowsHtml}</table>
+    </div>`;
+}
+
+// ── component ──────────────────────────────────────────────────────────────
 interface FetchResult {
   vehicles: BusVehicle[];
   count: number;
@@ -58,21 +109,64 @@ interface FetchResult {
 }
 
 export default function BusMap() {
-  const mapRef = useRef<import('leaflet').Map | null>(null);
-  const markersRef = useRef<Map<string, import('leaflet').Marker>>(new Map());
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [status, setStatus] = useState<'loading' | 'ok' | 'error'>('loading');
-  const [busCount, setBusCount] = useState(0);
-  const [lastUpdate, setLastUpdate] = useState<string>('');
-  const [errorMsg, setErrorMsg] = useState('');
-  const [countdown, setCountdown] = useState(REFRESH_INTERVAL);
-  const countdownRef = useRef(REFRESH_INTERVAL);
-  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mapRef        = useRef<import('leaflet').Map | null>(null);
+  const markersRef    = useRef<Map<string, import('leaflet').Marker>>(new Map());
+  const bearingsRef   = useRef<Map<string, number>>(new Map()); // current rendered bearing
+  const containerRef  = useRef<HTMLDivElement>(null);
+  const animTasksRef  = useRef<Map<string, AnimTask>>(new Map());
+  const rafRef        = useRef<number | null>(null);
 
+  const [status,     setStatus]     = useState<'loading' | 'ok' | 'error'>('loading');
+  const [busCount,   setBusCount]   = useState(0);
+  const [lastUpdate, setLastUpdate] = useState('');
+  const [errorMsg,   setErrorMsg]   = useState('');
+  const [countdown,  setCountdown]  = useState(REFRESH_INTERVAL);
+  const countdownRef = useRef(REFRESH_INTERVAL);
+  const timerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // ── RAF animation loop ──────────────────────────────────────────────────
+  const startRaf = useCallback(() => {
+    if (rafRef.current != null) return;
+
+    const loop = () => {
+      const now  = performance.now();
+      let active = false;
+
+      for (const [id, task] of animTasksRef.current) {
+        const t = Math.min((now - task.startTime) / ANIM_DURATION, 1);
+        const e = easeOutCubic(t);
+
+        const marker = markersRef.current.get(id);
+        if (marker && L) {
+          // interpolate position
+          const lat = lerp(task.fromLat, task.toLat, e);
+          const lng = lerp(task.fromLng, task.toLng, e);
+          marker.setLatLng([lat, lng]);
+
+          // interpolate bearing and redraw icon
+          const bearing = lerpAngle(task.fromBearing, task.toBearing, e);
+          bearingsRef.current.set(id, bearing);
+          marker.setIcon(getBusIcon(L, bearing, undefined /* keep colour */));
+        }
+
+        if (t < 1) {
+          active = true;
+        } else {
+          animTasksRef.current.delete(id);
+        }
+      }
+
+      rafRef.current = active ? requestAnimationFrame(loop) : null;
+    };
+
+    rafRef.current = requestAnimationFrame(loop);
+  }, []);
+
+  // ── fetch buses ──────────────────────────────────────────────────────────
   const fetchBuses = useCallback(async () => {
     if (!mapRef.current || !L) return;
     try {
-      const res = await fetch('/api/buses', { cache: 'no-store' });
+      const res  = await fetch('/api/buses', { cache: 'no-store' });
       const data: FetchResult = await res.json();
 
       if (!res.ok || data.error) {
@@ -82,33 +176,46 @@ export default function BusMap() {
       }
 
       const map = mapRef.current;
-      const lf = L;
+      const lf  = L;
       const existingIds = new Set(markersRef.current.keys());
 
       for (const bus of data.vehicles) {
-        const latlng: [number, number] = [bus.lat, bus.lon];
-        const icon = getBusIcon(lf, bus.bearing, bus.routeId);
-        const popupContent = buildPopup(bus);
+        const newBearing = bus.bearing ?? 0;
+        const icon       = getBusIcon(lf, newBearing, bus.routeId);
+        const popup      = buildPopup(bus);
 
         if (markersRef.current.has(bus.id)) {
-          const marker = markersRef.current.get(bus.id)!;
-          marker.setLatLng(latlng);
-          marker.setIcon(icon);
-          marker.getPopup()?.setContent(popupContent);
+          const marker     = markersRef.current.get(bus.id)!;
+          const cur        = marker.getLatLng();
+          const fromBearing = bearingsRef.current.get(bus.id) ?? newBearing;
+
+          // register animation task (position + bearing)
+          animTasksRef.current.set(bus.id, {
+            fromLat: cur.lat, fromLng: cur.lng,
+            toLat:   bus.lat, toLng:   bus.lon,
+            fromBearing, toBearing: newBearing,
+            startTime: performance.now(),
+          });
+
+          marker.getPopup()?.setContent(popup);
           existingIds.delete(bus.id);
+          startRaf();
         } else {
           const marker = lf
-            .marker(latlng, { icon })
-            .bindPopup(popupContent, { maxWidth: 240 })
+            .marker([bus.lat, bus.lon], { icon })
+            .bindPopup(popup, { maxWidth: 260 })
             .addTo(map);
           markersRef.current.set(bus.id, marker);
+          bearingsRef.current.set(bus.id, newBearing);
         }
       }
 
-      // 消えたバスを削除
+      // remove buses that disappeared
       for (const oldId of existingIds) {
         markersRef.current.get(oldId)?.remove();
         markersRef.current.delete(oldId);
+        bearingsRef.current.delete(oldId);
+        animTasksRef.current.delete(oldId);
       }
 
       setBusCount(data.count);
@@ -119,12 +226,11 @@ export default function BusMap() {
       setStatus('error');
       setErrorMsg(e instanceof Error ? e.message : 'ネットワークエラー');
     }
-  }, []);
+  }, [startRaf]);
 
-  // マップ初期化
+  // ── map init ─────────────────────────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
-
     (async () => {
       const leaflet = await import('leaflet');
       L = leaflet;
@@ -132,15 +238,14 @@ export default function BusMap() {
       const map = leaflet.map(containerRef.current!, {
         center: SENDAI_CENTER,
         zoom: 13,
-        zoomControl: true,
       });
 
+      // Standard OpenStreetMap tiles (light, readable)
       leaflet
-        .tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+        .tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
           attribution:
-            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
-          subdomains: 'abcd',
-          maxZoom: 20,
+            '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+          maxZoom: 19,
         })
         .addTo(map);
 
@@ -149,7 +254,7 @@ export default function BusMap() {
     })();
   }, [fetchBuses]);
 
-  // 自動更新タイマー
+  // ── countdown + auto-refresh ─────────────────────────────────────────────
   useEffect(() => {
     const tick = () => {
       countdownRef.current -= 1;
@@ -161,9 +266,7 @@ export default function BusMap() {
       timerRef.current = setTimeout(tick, 1000);
     };
     timerRef.current = setTimeout(tick, 1000);
-    return () => {
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
+    return () => { if (timerRef.current) clearTimeout(timerRef.current); };
   }, [fetchBuses]);
 
   const handleRefresh = () => {
@@ -173,89 +276,68 @@ export default function BusMap() {
     fetchBuses();
   };
 
+  // ── render ───────────────────────────────────────────────────────────────
   return (
     <div className="relative w-full h-full">
-      {/* Map container */}
       <div ref={containerRef} className="w-full h-full" />
 
-      {/* Header overlay */}
+      {/* Header */}
       <div className="absolute top-3 left-1/2 -translate-x-1/2 z-[1000] pointer-events-none">
-        <div className="bg-black/75 backdrop-blur-sm text-white rounded-xl px-5 py-2.5 shadow-xl flex items-center gap-4 pointer-events-auto">
+        <div className="bg-white/92 backdrop-blur-sm text-gray-800 rounded-xl px-5 py-2.5 shadow-lg
+                        flex items-center gap-4 pointer-events-auto border border-gray-200">
           <div className="flex items-center gap-2">
             <span className="text-xl">🚌</span>
             <div>
-              <div className="text-sm font-bold leading-tight">仙台市バス リアルタイムマップ</div>
-              <div className="text-[10px] text-gray-400 leading-tight">Sendai Municipal Bus Live Tracker</div>
+              <div className="text-sm font-bold leading-tight text-gray-900">仙台市バス リアルタイムマップ</div>
+              <div className="text-[10px] text-gray-500 leading-tight">Sendai Municipal Bus Live Tracker</div>
             </div>
           </div>
-          <div className="h-8 w-px bg-white/20" />
+          <div className="h-8 w-px bg-gray-200" />
           {status === 'loading' && (
-            <div className="flex items-center gap-1.5 text-yellow-400 text-xs">
+            <div className="flex items-center gap-1.5 text-blue-500 text-xs">
               <svg className="animate-spin h-3.5 w-3.5" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
               </svg>
-              <span>取得中...</span>
+              取得中...
             </div>
           )}
           {status === 'ok' && (
-            <div className="text-xs text-gray-300 flex flex-col items-end">
-              <span className="text-green-400 font-semibold">{busCount} 台運行中</span>
-              <span className="text-[10px] text-gray-500">更新: {lastUpdate}</span>
+            <div className="text-xs flex flex-col items-end">
+              <span className="text-green-600 font-semibold">{busCount} 台運行中</span>
+              <span className="text-[10px] text-gray-400">更新: {lastUpdate}</span>
             </div>
           )}
           {status === 'error' && (
-            <div className="text-xs text-red-400 max-w-[180px] truncate">{errorMsg}</div>
+            <div className="text-xs text-red-500 max-w-[180px] truncate">{errorMsg}</div>
           )}
         </div>
       </div>
 
       {/* Bottom controls */}
-      <div className="absolute bottom-5 right-3 z-[1000] flex flex-col gap-2 items-end">
+      <div className="absolute bottom-6 right-3 z-[1000] flex flex-col gap-2 items-end">
         <button
           onClick={handleRefresh}
-          className="bg-black/75 backdrop-blur-sm text-white text-xs rounded-lg px-3 py-2 shadow-lg hover:bg-black/90 transition flex items-center gap-1.5"
+          className="bg-white/92 backdrop-blur-sm text-gray-700 text-xs rounded-lg px-3 py-2
+                     shadow-md hover:bg-white transition flex items-center gap-1.5 border border-gray-200"
         >
           <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003
+                 8.003 0 01-15.357-2m15.357 2H15"/>
           </svg>
           今すぐ更新
         </button>
-        <div className="bg-black/60 backdrop-blur-sm text-gray-400 text-[11px] rounded-lg px-3 py-1.5 shadow">
+        <div className="bg-white/85 backdrop-blur-sm text-gray-500 text-[11px] rounded-lg px-3
+                        py-1.5 shadow border border-gray-100">
           次回更新: {countdown}秒後
         </div>
-        <div className="bg-black/60 backdrop-blur-sm text-gray-500 text-[10px] rounded-lg px-3 py-1.5 shadow leading-relaxed">
+        <div className="bg-white/80 backdrop-blur-sm text-gray-400 text-[10px] rounded-lg px-3
+                        py-1.5 shadow border border-gray-100 leading-relaxed">
           <div>データ: ODPT 仙台市交通局</div>
           <div>30秒ごとに自動更新</div>
         </div>
       </div>
     </div>
   );
-}
-
-function buildPopup(bus: BusVehicle): string {
-  const rows = [
-    ['車両ID', bus.vehicleLabel ?? bus.id],
-    ['路線', bus.routeId ?? '-'],
-    ['便', bus.tripId ?? '-'],
-    ['速度', bus.speed != null ? `${bus.speed} km/h` : '-'],
-    ['方位', bus.bearing != null ? `${bus.bearing}°` : '-'],
-    ['状態', bus.currentStatus ?? '-'],
-    ['更新', formatTime(bus.timestamp)],
-  ];
-
-  const rowsHtml = rows
-    .map(
-      ([label, value]) =>
-        `<tr><td style="color:#9ca3af;padding:2px 8px 2px 0;font-size:11px;white-space:nowrap">${label}</td>
-         <td style="color:#f3f4f6;padding:2px 0;font-size:11px;font-weight:500">${value}</td></tr>`
-    )
-    .join('');
-
-  return `
-    <div style="background:#1f2937;color:#f3f4f6;border-radius:8px;padding:10px 12px;min-width:180px;font-family:system-ui,sans-serif">
-      <div style="font-weight:700;font-size:13px;margin-bottom:6px;color:#60a5fa">🚌 バス情報</div>
-      <table style="border-collapse:collapse;width:100%">${rowsHtml}</table>
-    </div>
-  `;
 }
