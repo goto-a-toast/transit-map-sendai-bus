@@ -127,6 +127,8 @@ export default function BusMap() {
   const [lastUpdate, setLastUpdate] = useState('');
   const [errorMsg,   setErrorMsg]   = useState('');
   const [countdown,  setCountdown]  = useState(REFRESH_INTERVAL);
+  const [drEnabled,  setDrEnabled]  = useState(true);
+  const drEnabledRef = useRef(true);
   const countdownRef = useRef(REFRESH_INTERVAL);
   const timerRef     = useRef<ReturnType<typeof setTimeout>|null>(null);
 
@@ -166,16 +168,18 @@ export default function BusMap() {
       }
 
       // 2. Dead reckoning: extrapolate movement for non-lerping buses
-      for (const [id, dr] of drRef.current) {
-        if (lerpTasksRef.current.has(id)) continue; // lerp has priority
-        if (dr.speedMs <= 0) continue;
+      if (drEnabledRef.current) {
+        for (const [id, dr] of drRef.current) {
+          if (lerpTasksRef.current.has(id)) continue; // lerp has priority
+          if (dr.speedMs <= 0) continue;
 
-        const elapsed = (now - dr.time) / 1000;
-        if (elapsed >= DR_CAP_SEC) continue; // stop extrapolating after cap
+          const elapsed = (now - dr.time) / 1000;
+          if (elapsed >= DR_CAP_SEC) continue; // stop extrapolating after cap
 
-        const [lat, lng] = deadReckon(dr.lat, dr.lng, dr.bearingDeg, dr.speedMs, elapsed);
-        markersRef.current.get(id)?.setLatLng([lat, lng]);
-        needsNextFrame = true;
+          const [lat, lng] = deadReckon(dr.lat, dr.lng, dr.bearingDeg, dr.speedMs, elapsed);
+          markersRef.current.get(id)?.setLatLng([lat, lng]);
+          needsNextFrame = true;
+        }
       }
 
       rafRef.current = needsNextFrame ? requestAnimationFrame(loop) : null;
@@ -296,6 +300,23 @@ export default function BusMap() {
     fetchBuses();
   };
 
+  const handleToggleDr = () => {
+    const next = !drEnabledRef.current;
+    drEnabledRef.current = next;
+    setDrEnabled(next);
+    if (!next) {
+      // DR off → snap all markers back to their last reported anchor position
+      for (const [id, dr] of drRef.current) {
+        markersRef.current.get(id)?.setLatLng([dr.lat, dr.lng]);
+      }
+    } else {
+      // DR on → reset anchor clocks so extrapolation starts fresh from current anchor
+      const now = performance.now();
+      for (const dr of drRef.current.values()) dr.time = now;
+      startRaf();
+    }
+  };
+
   // ── render ───────────────────────────────────────────────────────────────
   return (
     <div className="relative w-full h-full">
@@ -346,6 +367,20 @@ export default function BusMap() {
               d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/>
           </svg>
           今すぐ更新
+        </button>
+        <button
+          onClick={handleToggleDr}
+          className={`backdrop-blur-sm text-xs rounded-lg px-3 py-2 shadow-md transition
+                      flex items-center gap-1.5 border
+                      ${drEnabled
+                        ? 'bg-blue-500 text-white border-blue-400 hover:bg-blue-600'
+                        : 'bg-white/92 text-gray-500 border-gray-200 hover:bg-white'}`}
+        >
+          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+              d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/>
+          </svg>
+          推算移動: {drEnabled ? 'ON' : 'OFF'}
         </button>
         <div className="bg-white/85 backdrop-blur-sm text-gray-500 text-[11px] rounded-lg px-3
                         py-1.5 shadow border border-gray-100">
