@@ -87,7 +87,7 @@ function formatTime(ts?: number): string {
 function buildPopup(bus: BusVehicle): string {
   const rows: [string, string][] = [
     ['車両', bus.vehicleLabel ?? bus.id],
-    ['路線', bus.routeId ?? '-'],
+    ['路線', bus.routeName ?? bus.routeId ?? '-'],
     ['便',   bus.tripId  ?? '-'],
     ['速度', bus.speed   != null ? `${bus.speed} km/h` : '-'],
     ['方位', bus.bearing != null ? `${Math.round(bus.bearing)}°` : '-'],
