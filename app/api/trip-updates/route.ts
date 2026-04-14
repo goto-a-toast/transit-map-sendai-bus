@@ -39,10 +39,13 @@ export async function GET(req: NextRequest) {
 
     const now      = Date.now();
     const arrivals: Arrival[] = [];
+    const sampleStopIds = new Set<string>();
+    let tripCount = 0;
 
     for (const entity of feed.entity) {
       const tu = entity.tripUpdate;
       if (!tu) continue;
+      tripCount++;
 
       const tripId  = tu.trip?.tripId  ?? entity.id;
       const routeId = tu.trip?.routeId ?? (gtfs?.trips[tripId]?.routeId ?? '');
@@ -50,6 +53,7 @@ export async function GET(req: NextRequest) {
       const trip    = gtfs?.trips[tripId];
 
       for (const stu of (tu.stopTimeUpdate ?? [])) {
+        if (stu.stopId) sampleStopIds.add(stu.stopId);
         if (stu.stopId !== stopId) continue;
 
         const arrMs = stu.arrival?.time
@@ -75,7 +79,12 @@ export async function GET(req: NextRequest) {
 
     arrivals.sort((a, b) => a.arrivalTime - b.arrivalTime);
 
-    return NextResponse.json({ stopId, arrivals: arrivals.slice(0, 8), fetchedAt: now });
+    // Return sample stop IDs for debugging when no arrivals found
+    const debug = arrivals.length === 0
+      ? { tripCount, sampleStopIds: [...sampleStopIds].slice(0, 6) }
+      : undefined;
+
+    return NextResponse.json({ stopId, arrivals: arrivals.slice(0, 8), fetchedAt: now, debug });
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'エラー' },

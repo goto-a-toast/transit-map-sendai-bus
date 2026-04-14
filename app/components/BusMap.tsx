@@ -11,7 +11,7 @@ const REFRESH_INTERVAL = 15;
 const LERP_DURATION    = 1500;
 const DR_CAP_SEC       = 20;
 const DR_SPEED_FACTOR  = 0.65;
-const STOP_MIN_ZOOM    = 15;
+const STOP_MIN_ZOOM    = 14;
 
 let L: typeof import('leaflet') | null = null;
 
@@ -115,6 +115,7 @@ interface DrAnchor {
 }
 interface FetchResult { vehicles: BusVehicle[]; count: number; fetchedAt: number; error?: string; }
 interface SelectedStop { id: string; name: string; }
+interface ArrivalDebug { tripCount: number; sampleStopIds: string[]; }
 
 // ── component ─────────────────────────────────────────────────────────────
 export default function BusMap() {
@@ -142,10 +143,14 @@ export default function BusMap() {
   const [countdown,       setCountdown]       = useState(REFRESH_INTERVAL);
   const [drEnabled,       setDrEnabled]       = useState(true);
   const [gtfsReady,       setGtfsReady]       = useState(false);
+  const [gtfsError,       setGtfsError]       = useState('');
+  const [stopCount,       setStopCount]       = useState(0);
   const [alerts,          setAlerts]          = useState<ServiceAlert[]>([]);
   const [dismissAlerts,   setDismissAlerts]   = useState(false);
   const [selectedStop,    setSelectedStop]    = useState<SelectedStop | null>(null);
   const [arrivals,        setArrivals]        = useState<Arrival[]>([]);
+  const [arrivalError,    setArrivalError]    = useState('');
+  const [arrivalDebug,    setArrivalDebug]    = useState<ArrivalDebug | null>(null);
   const [approachLoading, setApproachLoading] = useState(false);
 
   // ── RAF loop ──────────────────────────────────────────────────────────
@@ -266,19 +271,31 @@ export default function BusMap() {
   ) => {
     try {
       const res = await fetch('/api/gtfs-static');
-      if (!res.ok) return;
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        setGtfsError(`GTFSデータ取得失敗 (${res.status}): ${(body as {error?: string}).error ?? res.statusText}`);
+        return;
+      }
       const data: {
         routes: Record<string, GtfsRoute>;
         stops:  GtfsStop[];
         trips:  Record<string, GtfsTrip>;
+        error?: string;
       } = await res.json();
+
+      if (data.error) { setGtfsError(`GTFSエラー: ${data.error}`); return; }
 
       gtfsRoutesRef.current = data.routes ?? {};
       gtfsTripsRef.current  = data.trips  ?? {};
       setGtfsReady(true);
 
       // ── stop markers ──
-      if (!data.stops?.length) return;
+      if (!data.stops?.length) {
+        setGtfsError('バス停データが空です');
+        return;
+      }
+      setStopCount(data.stops.length);
+
       const layer    = lf.layerGroup();
       stopLayerRef.current = layer;
       const stopIcon = getStopIcon(lf);
@@ -296,7 +313,9 @@ export default function BusMap() {
       };
       map.on('zoomend', sync);
       sync();
-    } catch { /* GTFS static optional — buses still work */ }
+    } catch (e) {
+      setGtfsError(e instanceof Error ? e.message : 'GTFSデータ読込エラー');
+    }
   }, []);
 
   // ── fetch approach times ──────────────────────────────────────────────
@@ -304,10 +323,15 @@ export default function BusMap() {
     if (!selectedStop) return;
     setApproachLoading(true);
     setArrivals([]);
+    setArrivalError('');
+    setArrivalDebug(null);
     fetch(`/api/trip-updates?stopId=${encodeURIComponent(selectedStop.id)}`)
       .then(r => r.json())
-      .then(d => setArrivals(d.arrivals ?? []))
-      .catch(() => setArrivals([]))
+      .then(d => {
+        if (d.error) { setArrivalError(d.error); setArrivals([]); }
+        else         { setArrivals(d.arrivals ?? []); setArrivalDebug(d.debug ?? null); }
+      })
+      .catch(e => setArrivalError(e instanceof Error ? e.message : 'ネットワークエラー'))
       .finally(() => setApproachLoading(false));
   }, [selectedStop]);
 
@@ -427,7 +451,8 @@ export default function BusMap() {
               <div className="text-sm font-bold text-gray-900 leading-tight">仙台市バス リアルタイムマップ</div>
               <div className="text-[10px] text-gray-400 leading-tight">
                 Sendai Municipal Bus Live Tracker
-                {gtfsReady && <span className="ml-1 text-green-500">· 路線名読込済</span>}
+                {gtfsReady  && <span className="ml-1 text-green-500">· バス停 {stopCount}件</span>}
+                {gtfsError  && <span className="ml-1 text-red-400" title={gtfsError}>· GTFS失敗</span>}
               </div>
             </div>
           </div>
@@ -493,11 +518,17 @@ export default function BusMap() {
               <span className="text-blue-500 text-lg">🚏</span>
               <div>
                 <div className="font-bold text-gray-900 text-sm">{selectedStop.name}</div>
-                <div className="text-[10px] text-gray-400">次のバス</div>
+                <div className="text-[10px] text-gray-400 font-mono">{selectedStop.id} · 次のバス</div>
               </div>
             </div>
-            <button onClick={() => { setSelectedStop(null); setArrivals([]); }}
-              className="text-gray-400 hover:text-gray-600 text-xl leading-none px-1">✕</button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setSelectedStop(s => s ? { ...s } : null)}
+                title="再読み込み"
+                className="text-blue-400 hover:text-blue-600 text-sm px-1">↺</button>
+              <button onClick={() => { setSelectedStop(null); setArrivals([]); }}
+                className="text-gray-400 hover:text-gray-600 text-xl leading-none px-1">✕</button>
+            </div>
           </div>
 
           <div className="overflow-y-auto flex-1 divide-y divide-gray-50">
@@ -510,9 +541,23 @@ export default function BusMap() {
                 取得中...
               </div>
             )}
-            {!approachLoading && arrivals.length === 0 && (
-              <div className="text-center py-8 text-gray-400 text-sm">
-                接近中のバスはありません
+            {!approachLoading && arrivalError && (
+              <div className="px-4 py-6 text-center">
+                <div className="text-red-500 text-sm mb-1">エラー</div>
+                <div className="text-[11px] text-gray-400">{arrivalError}</div>
+              </div>
+            )}
+            {!approachLoading && !arrivalError && arrivals.length === 0 && (
+              <div className="px-4 py-6 text-center">
+                <div className="text-gray-400 text-sm mb-2">接近中のバスはありません</div>
+                {arrivalDebug && (
+                  <div className="text-[10px] text-gray-300 text-left bg-gray-50 rounded-lg p-2 space-y-1">
+                    <div>TripUpdate件数: {arrivalDebug.tripCount}</div>
+                    {arrivalDebug.sampleStopIds.length > 0 && (
+                      <div>フィード内のstopId例: <span className="font-mono">{arrivalDebug.sampleStopIds.join(', ')}</span></div>
+                    )}
+                  </div>
+                )}
               </div>
             )}
             {!approachLoading && arrivals.map((arr, i) => {
