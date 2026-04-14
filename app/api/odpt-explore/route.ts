@@ -1,52 +1,68 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import { unzipSync } from 'fflate';
+import { inflateRawSync } from 'node:zlib';
 
 export const runtime = 'nodejs';
 export const revalidate = 0;
 
 const GTFS_URL = 'https://miyagi.dataeye.jp/resource_download/256';
 
+const GTFS_NAMES = new Set([
+  'agency.txt','stops.txt','routes.txt','trips.txt','stop_times.txt',
+  'calendar.txt','calendar_dates.txt','feed_info.txt','shapes.txt',
+  'fare_attributes.txt','fare_rules.txt','frequencies.txt','transfers.txt',
+  'translations.txt','attributions.txt','office_jp.txt','routes_jp.txt',
+]);
+
 function stripBom(buf: Uint8Array): Uint8Array {
   return (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) ? buf.slice(3) : buf;
 }
 
-/** Find EOCD record, return { totalEntries, cdOffset, cdSize } or null */
-function readEocd(data: Uint8Array) {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  // Search backward from end
-  for (let i = data.length - 22; i >= Math.max(0, data.length - 65558); i--) {
-    if (data[i] === 0x50 && data[i+1] === 0x4B && data[i+2] === 0x05 && data[i+3] === 0x06) {
-      return {
-        totalEntries: view.getUint16(i + 10, true),
-        cdSize:       view.getUint32(i + 12, true),
-        cdOffset:     view.getUint32(i + 16, true),
-      };
-    }
-  }
-  return null;
+interface CdEntry {
+  pos: number; name: string;
+  method: number; cSize: number; uSize: number; localOffset: number;
 }
 
-/** Parse central directory manually, ignoring file data offsets being wrong */
-function scanCentralDir(data: Uint8Array, cdOffset: number, totalEntries: number) {
+/** Scan the entire file for central-directory entries (PK\x01\x02) whose
+ *  filename matches a known GTFS file. */
+function findCdEntries(data: Uint8Array): Record<string, CdEntry> {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const td = new TextDecoder('utf-8');
-  const entries: Array<{ name: string; localOffset: number; cSize: number; uSize: number; method: number }> = [];
-  let pos = cdOffset;
-  for (let i = 0; i < totalEntries && pos + 46 < data.length; i++) {
-    if (!(data[pos]===0x50 && data[pos+1]===0x4B && data[pos+2]===0x01 && data[pos+3]===0x02)) break;
-    const method      = view.getUint16(pos + 10, true);
-    const cSize       = view.getUint32(pos + 20, true);
-    const uSize       = view.getUint32(pos + 24, true);
-    const nameLen     = view.getUint16(pos + 28, true);
-    const extraLen    = view.getUint16(pos + 30, true);
-    const commentLen  = view.getUint16(pos + 32, true);
-    const localOffset = view.getUint32(pos + 42, true);
-    const name        = td.decode(data.slice(pos + 46, pos + 46 + nameLen));
-    entries.push({ name, localOffset, cSize, uSize, method });
-    pos += 46 + nameLen + extraLen + commentLen;
+  const td   = new TextDecoder('utf-8');
+  const out: Record<string, CdEntry> = {};
+
+  for (let i = 0; i + 46 < data.length; i++) {
+    if (data[i]!==0x50 || data[i+1]!==0x4B || data[i+2]!==0x01 || data[i+3]!==0x02) continue;
+    const nameLen = view.getUint16(i + 28, true);
+    if (nameLen < 3 || nameLen > 40 || i + 46 + nameLen > data.length) continue;
+    const name = td.decode(data.slice(i + 46, i + 46 + nameLen));
+    if (!GTFS_NAMES.has(name)) continue;
+
+    out[name] = {
+      pos:         i,
+      name,
+      method:      view.getUint16(i + 10, true),
+      cSize:       view.getUint32(i + 20, true),
+      uSize:       view.getUint32(i + 24, true),
+      localOffset: view.getUint32(i + 42, true),
+    };
   }
-  return entries;
+  return out;
+}
+
+/** Scan the entire file for local-file headers (PK\x03\x04) whose
+ *  filename matches a known GTFS file. Returns name → byte offset. */
+function findLocalHeaders(data: Uint8Array): Record<string, number> {
+  const td  = new TextDecoder('utf-8');
+  const out: Record<string, number> = {};
+
+  for (let i = 0; i + 30 < data.length; i++) {
+    if (data[i]!==0x50 || data[i+1]!==0x4B || data[i+2]!==0x03 || data[i+3]!==0x04) continue;
+    const nameLen = (data[i+26] | (data[i+27] << 8));
+    if (nameLen < 3 || nameLen > 40 || i + 30 + nameLen > data.length) continue;
+    const name = td.decode(data.slice(i + 30, i + 30 + nameLen));
+    if (GTFS_NAMES.has(name) && !(name in out)) out[name] = i;
+  }
+  return out;
 }
 
 export async function GET(req: NextRequest) {
@@ -66,75 +82,69 @@ export async function GET(req: NextRequest) {
 
     const raw  = new Uint8Array(await res.arrayBuffer());
     const data = stripBom(raw);
+    const td   = new TextDecoder('utf-8');
 
-    // ── Step 1: Read EOCD ──────────────────────────────────────────────
-    const eocd = readEocd(data);
-    const cdEntries = eocd ? scanCentralDir(data, eocd.cdOffset, eocd.totalEntries) : [];
+    // Locate central-directory & local-header entries for GTFS files
+    const cdEntries    = findCdEntries(data);
+    const localHeaders = findLocalHeaders(data);
 
-    // ── Step 2: Try fflate first ───────────────────────────────────────
-    let unzipped: ReturnType<typeof unzipSync> | null = null;
-    let fflateError = '';
-    try {
-      unzipped = unzipSync(data);
-    } catch (e) {
-      fflateError = e instanceof Error ? e.message : String(e);
-    }
+    const cdNames    = Object.keys(cdEntries);
+    const localNames = Object.keys(localHeaders);
 
-    const td = new TextDecoder('utf-8');
+    // Try to extract each GTFS file
+    const extracted: Record<string, string[]> = {};
+    const errors:    string[] = [];
 
-    // ── Step 3: Check if the "" entry is itself a ZIP ──────────────────
-    if (unzipped) {
-      const emptyEntry = unzipped[''];
-      if (emptyEntry && emptyEntry.length > 4 &&
-          emptyEntry[0] === 0x50 && emptyEntry[1] === 0x4B) {
-        // Nested ZIP inside the "" entry
-        try {
-          const inner = unzipSync(emptyEntry);
-          const innerFiles = Object.keys(inner).sort();
-          const getText = (name: string) => inner[name] ? td.decode(inner[name]) : '';
-          return NextResponse.json({
-            ok: innerFiles.length > 0,
-            source: 'nested-zip',
-            count: innerFiles.length,
-            fileList: innerFiles,
-            stopsSample:  getText('stops.txt').split('\n').slice(0, 6),
-            routesSample: getText('routes.txt').split('\n').slice(0, 6),
-            tripsSample:  getText('trips.txt').split('\n').slice(0, 4),
-          });
-        } catch (e) {
-          // Fall through to diagnostics
-        }
+    for (const name of [...new Set([...cdNames, ...localNames])]) {
+      const cd       = cdEntries[name];
+      const localPos = localHeaders[name] ?? -1;
+
+      if (localPos < 0) {
+        errors.push(`${name}: CD found at pos=${cd?.pos} but no local header`);
+        continue;
       }
 
-      // ── Step 4: Check normal fflate output ────────────────────────────
-      const fileList = Object.keys(unzipped).sort();
-      if (fileList.some(f => f === 'stops.txt')) {
-        const getText = (name: string) => unzipped![name] ? td.decode(unzipped![name]) : '';
-        return NextResponse.json({
-          ok: true, source: 'fflate',
-          count: fileList.length, fileList,
-          stopsSample:  getText('stops.txt').split('\n').slice(0, 6),
-          routesSample: getText('routes.txt').split('\n').slice(0, 6),
-          tripsSample:  getText('trips.txt').split('\n').slice(0, 4),
-        });
+      // Parse local header to get dataStart
+      const localExtraLen = (data[localPos+28] | (data[localPos+29] << 8));
+      const localNameLen  = (data[localPos+26] | (data[localPos+27] << 8));
+      const dataStart     = localPos + 30 + localNameLen + localExtraLen;
+
+      // Prefer cSize from central directory (more reliable than local header)
+      const localCSize = new DataView(data.buffer, data.byteOffset).getUint32(localPos + 18, true);
+      const cSize      = (cd && cd.cSize > 0 && cd.cSize < data.length) ? cd.cSize : localCSize;
+      const method     = cd ? cd.method : (data[localPos+8] | (data[localPos+9] << 8));
+
+      if (cSize === 0) {
+        errors.push(`${name}: cSize=0 in both CD and local header`);
+        continue;
+      }
+      if (dataStart + cSize > data.length) {
+        errors.push(`${name}: out of bounds (dataStart=${dataStart}, cSize=${cSize}, fileLen=${data.length})`);
+        continue;
+      }
+
+      try {
+        const compressed = data.slice(dataStart, dataStart + cSize);
+        const raw2 = method === 0
+          ? compressed
+          : inflateRawSync(Buffer.from(compressed));
+        const text = td.decode(raw2);
+        extracted[name] = text.split('\n').slice(0, 4);
+      } catch (e) {
+        errors.push(`${name}: decompress err – ${e instanceof Error ? e.message : e}`);
       }
     }
-
-    // ── Step 5: Return diagnostics ────────────────────────────────────
-    const emptyLen   = unzipped?.[''] ? unzipped[''].length : 0;
-    const emptyMagic = unzipped?.[''] && unzipped[''].length >= 4
-      ? Buffer.from(unzipped[''].slice(0, 4)).toString('hex')
-      : 'n/a';
 
     return NextResponse.json({
-      ok: false,
-      totalBytes: data.length,
-      eocd,
-      cdEntries,          // what the central directory actually contains
-      fflateError,
-      fflateFiles: unzipped ? Object.keys(unzipped) : [],
-      emptyEntryBytes: emptyLen,
-      emptyEntryMagic:  emptyMagic,
+      ok:         Object.keys(extracted).length > 0,
+      cdFound:    cdNames,
+      localFound: localNames,
+      cdDetails:  Object.fromEntries(
+        cdNames.map(n => [n, { pos: cdEntries[n].pos, cSize: cdEntries[n].cSize, localOffset: cdEntries[n].localOffset }])
+      ),
+      localPositions: localHeaders,
+      extracted,
+      errors,
     });
 
   } catch (e) {
