@@ -2,8 +2,6 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type { BusVehicle } from '../api/buses/route';
-import type { GtfsRoute, GtfsStop, GtfsTrip } from '../../lib/gtfs-static';
-import type { Arrival } from '../api/trip-updates/route';
 import type { ServiceAlert } from '../api/alerts/route';
 
 const SENDAI_CENTER: [number, number] = [38.2682, 140.8694];
@@ -11,7 +9,6 @@ const REFRESH_INTERVAL = 15;
 const LERP_DURATION    = 1500;
 const DR_CAP_SEC       = 20;
 const DR_SPEED_FACTOR  = 0.65;
-const STOP_MIN_ZOOM    = 14;
 
 let L: typeof import('leaflet') | null = null;
 
@@ -32,13 +29,22 @@ function deadReckon(lat: number, lng: number, bear: number, spd: number, t: numb
   ];
 }
 
-// ── route colour ──────────────────────────────────────────────────────────
+// ── route colour & name ───────────────────────────────────────────────────
 function routeHue(routeId?: string) {
   if (!routeId) return 210;
   return Math.abs(routeId.split('').reduce((a, c) => a + c.charCodeAt(0), 0)) % 360;
 }
 
-// ── icons ─────────────────────────────────────────────────────────────────
+// Extract a short display label from the raw routeId string.
+// e.g. "odpt.Route:SendaiMunicipal.10" → "10系統"
+//      "10"                            → "10系統"
+function routeLabel(routeId?: string): string {
+  if (!routeId) return '-';
+  const last = routeId.split(/[.:]/).pop() ?? routeId;
+  return `${last}系統`;
+}
+
+// ── bus icon ─────────────────────────────────────────────────────────────
 function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: string) {
   const h = routeHue(routeId);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
@@ -57,37 +63,18 @@ function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: str
   return lf.divIcon({ html: svg, className: '', iconSize: [32, 32], iconAnchor: [16, 16], popupAnchor: [0, -18] });
 }
 
-function getStopIcon(lf: typeof import('leaflet')) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
-    <circle cx="8" cy="8" r="6" fill="#2563eb" stroke="white" stroke-width="2"/>
-  </svg>`;
-  return lf.divIcon({ html: svg, className: '', iconSize: [16, 16], iconAnchor: [8, 8] });
-}
-
 // ── popup ─────────────────────────────────────────────────────────────────
 function formatTime(ts?: number) {
   if (!ts) return '-';
   return new Date(ts).toLocaleTimeString('ja-JP');
 }
 
-function buildBusPopup(
-  bus: BusVehicle,
-  routes: Record<string, GtfsRoute>,
-  trips: Record<string, GtfsTrip>,
-): string {
-  const route    = bus.routeId ? routes[bus.routeId] : undefined;
-  const trip     = bus.tripId  ? trips[bus.tripId]   : undefined;
-  const h        = routeHue(bus.routeId);
-  const routeNum = route?.shortName || bus.routeId || '-';
-  const routeLong = route?.longName || '';
-  const headsign  = trip?.headsign  || '';
-
-  const routeCell = `${routeNum}系統${routeLong ? `<br><span style="font-size:10px;color:#6b7280;font-weight:400">${routeLong}</span>` : ''}`;
+function buildBusPopup(bus: BusVehicle): string {
+  const h = routeHue(bus.routeId);
   const rows: [string, string][] = [
     ['車両', bus.vehicleLabel ?? bus.id],
-    ['路線', routeCell],
-    ['行先', headsign || '-'],
-    ['速度', bus.speed  != null ? `${bus.speed} km/h` : '-'],
+    ['路線', routeLabel(bus.routeId)],
+    ['速度', bus.speed != null ? `${bus.speed} km/h` : '-'],
     ['状態', bus.currentStatus ?? '-'],
     ['更新', formatTime(bus.timestamp)],
   ];
@@ -97,7 +84,7 @@ function buildBusPopup(
       <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
     </tr>`
   ).join('');
-  return `<div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:195px;
+  return `<div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:180px;
     font-family:system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.15)">
     <div style="font-weight:700;font-size:13px;margin-bottom:7px;color:hsl(${h},65%,40%)">🚌 バス情報</div>
     <table style="border-collapse:collapse;width:100%">${rowsHtml}</table>
@@ -114,8 +101,6 @@ interface DrAnchor {
   time: number; routeId?: string;
 }
 interface FetchResult { vehicles: BusVehicle[]; count: number; fetchedAt: number; error?: string; }
-interface SelectedStop { id: string; name: string; }
-interface ArrivalDebug { tripCount: number; sampleStopIds: string[]; }
 
 // ── component ─────────────────────────────────────────────────────────────
 export default function BusMap() {
@@ -127,31 +112,18 @@ export default function BusMap() {
   const lerpRef      = useRef<Map<string, LerpTask>>(new Map());
   const drRef        = useRef<Map<string, DrAnchor>>(new Map());
   const rafRef       = useRef<number | null>(null);
-  const stopLayerRef = useRef<import('leaflet').LayerGroup | null>(null);
   const drEnabledRef = useRef(true);
   const countdownRef = useRef(REFRESH_INTERVAL);
   const timerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // GTFS static — stored in refs so popup builder always reads latest
-  const gtfsRoutesRef = useRef<Record<string, GtfsRoute>>({});
-  const gtfsTripsRef  = useRef<Record<string, GtfsTrip>>({});
-
-  const [status,          setStatus]          = useState<'loading' | 'ok' | 'error'>('loading');
-  const [busCount,        setBusCount]        = useState(0);
-  const [lastUpdate,      setLastUpdate]      = useState('');
-  const [errorMsg,        setErrorMsg]        = useState('');
-  const [countdown,       setCountdown]       = useState(REFRESH_INTERVAL);
-  const [drEnabled,       setDrEnabled]       = useState(true);
-  const [gtfsReady,       setGtfsReady]       = useState(false);
-  const [gtfsError,       setGtfsError]       = useState('');
-  const [stopCount,       setStopCount]       = useState(0);
-  const [alerts,          setAlerts]          = useState<ServiceAlert[]>([]);
-  const [dismissAlerts,   setDismissAlerts]   = useState(false);
-  const [selectedStop,    setSelectedStop]    = useState<SelectedStop | null>(null);
-  const [arrivals,        setArrivals]        = useState<Arrival[]>([]);
-  const [arrivalError,    setArrivalError]    = useState('');
-  const [arrivalDebug,    setArrivalDebug]    = useState<ArrivalDebug | null>(null);
-  const [approachLoading, setApproachLoading] = useState(false);
+  const [status,        setStatus]        = useState<'loading' | 'ok' | 'error'>('loading');
+  const [busCount,      setBusCount]      = useState(0);
+  const [lastUpdate,    setLastUpdate]    = useState('');
+  const [errorMsg,      setErrorMsg]      = useState('');
+  const [countdown,     setCountdown]     = useState(REFRESH_INTERVAL);
+  const [drEnabled,     setDrEnabled]     = useState(true);
+  const [alerts,        setAlerts]        = useState<ServiceAlert[]>([]);
+  const [dismissAlerts, setDismissAlerts] = useState(false);
 
   // ── RAF loop ──────────────────────────────────────────────────────────
   const startRaf = useCallback(() => {
@@ -227,13 +199,8 @@ export default function BusMap() {
           startRaf();
         } else {
           const icon = getBusIcon(lf, newBearing, bus.routeId);
-          // popup uses a function so it always reads the latest GTFS refs
           const marker = lf.marker([bus.lat, bus.lon], { icon })
-            .bindPopup(() => buildBusPopup(
-              busDataRef.current.get(bus.id) ?? bus,
-              gtfsRoutesRef.current,
-              gtfsTripsRef.current,
-            ), { maxWidth: 280 })
+            .bindPopup(() => buildBusPopup(busDataRef.current.get(bus.id) ?? bus), { maxWidth: 260 })
             .addTo(mapRef.current!);
           markersRef.current.set(bus.id, marker);
           bearingsRef.current.set(bus.id, newBearing);
@@ -264,77 +231,6 @@ export default function BusMap() {
     }
   }, [startRaf]);
 
-  // ── load GTFS static (stops + routes) ────────────────────────────────
-  const loadGtfsStatic = useCallback(async (
-    map: import('leaflet').Map,
-    lf: typeof import('leaflet'),
-  ) => {
-    try {
-      const res = await fetch('/api/gtfs-static');
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}));
-        setGtfsError(`GTFSデータ取得失敗 (${res.status}): ${(body as {error?: string}).error ?? res.statusText}`);
-        return;
-      }
-      const data: {
-        routes: Record<string, GtfsRoute>;
-        stops:  GtfsStop[];
-        trips:  Record<string, GtfsTrip>;
-        error?: string;
-      } = await res.json();
-
-      if (data.error) { setGtfsError(`GTFSエラー: ${data.error}`); return; }
-
-      gtfsRoutesRef.current = data.routes ?? {};
-      gtfsTripsRef.current  = data.trips  ?? {};
-      setGtfsReady(true);
-
-      // ── stop markers ──
-      if (!data.stops?.length) {
-        setGtfsError('バス停データが空です');
-        return;
-      }
-      setStopCount(data.stops.length);
-
-      const layer    = lf.layerGroup();
-      stopLayerRef.current = layer;
-      const stopIcon = getStopIcon(lf);
-
-      for (const stop of data.stops) {
-        const m = lf.marker([stop.lat, stop.lon], { icon: stopIcon });
-        m.bindTooltip(stop.name, { direction: 'top', offset: [0, -10], opacity: 0.9 });
-        m.on('click', () => setSelectedStop({ id: stop.id, name: stop.name }));
-        layer.addLayer(m);
-      }
-
-      const sync = () => {
-        if (map.getZoom() >= STOP_MIN_ZOOM) { if (!map.hasLayer(layer)) layer.addTo(map); }
-        else                                { if (map.hasLayer(layer))  layer.remove(); }
-      };
-      map.on('zoomend', sync);
-      sync();
-    } catch (e) {
-      setGtfsError(e instanceof Error ? e.message : 'GTFSデータ読込エラー');
-    }
-  }, []);
-
-  // ── fetch approach times ──────────────────────────────────────────────
-  useEffect(() => {
-    if (!selectedStop) return;
-    setApproachLoading(true);
-    setArrivals([]);
-    setArrivalError('');
-    setArrivalDebug(null);
-    fetch(`/api/trip-updates?stopId=${encodeURIComponent(selectedStop.id)}`)
-      .then(r => r.json())
-      .then(d => {
-        if (d.error) { setArrivalError(d.error); setArrivals([]); }
-        else         { setArrivals(d.arrivals ?? []); setArrivalDebug(d.debug ?? null); }
-      })
-      .catch(e => setArrivalError(e instanceof Error ? e.message : 'ネットワークエラー'))
-      .finally(() => setApproachLoading(false));
-  }, [selectedStop]);
-
   // ── fetch alerts ──────────────────────────────────────────────────────
   const fetchAlerts = useCallback(async () => {
     try {
@@ -357,13 +253,10 @@ export default function BusMap() {
         maxZoom: 19,
       }).addTo(map);
       mapRef.current = map;
-
-      // bus positions first (fast), then GTFS static in background
       await fetchBuses();
-      loadGtfsStatic(map, lf);  // non-blocking
       fetchAlerts();
     })();
-  }, [fetchBuses, loadGtfsStatic, fetchAlerts]);
+  }, [fetchBuses, fetchAlerts]);
 
   // ── countdown ─────────────────────────────────────────────────────────
   useEffect(() => {
@@ -408,13 +301,6 @@ export default function BusMap() {
     }
   };
 
-  function relTime(ms: number) {
-    const s = Math.round((ms - Date.now()) / 1000);
-    if (s <= 0)  return 'まもなく';
-    if (s < 60)  return `約${s}秒後`;
-    return `約${Math.round(s / 60)}分後`;
-  }
-
   const alertOffset = alerts.length > 0 && !dismissAlerts;
 
   // ── render ────────────────────────────────────────────────────────────
@@ -449,11 +335,7 @@ export default function BusMap() {
             <span className="text-xl">🚌</span>
             <div>
               <div className="text-sm font-bold text-gray-900 leading-tight">仙台市バス リアルタイムマップ</div>
-              <div className="text-[10px] text-gray-400 leading-tight">
-                Sendai Municipal Bus Live Tracker
-                {gtfsReady  && <span className="ml-1 text-green-500">· バス停 {stopCount}件</span>}
-                {gtfsError  && <span className="ml-1 text-red-400" title={gtfsError}>· GTFS失敗</span>}
-              </div>
+              <div className="text-[10px] text-gray-400 leading-tight">Sendai Municipal Bus Live Tracker</div>
             </div>
           </div>
           <div className="h-8 w-px bg-gray-200" />
@@ -502,97 +384,10 @@ export default function BusMap() {
           次回更新: {countdown}秒後
         </div>
         <div className="bg-white/80 backdrop-blur-sm text-gray-400 text-[10px] rounded-lg px-3
-                        py-1.5 shadow border border-gray-100 leading-relaxed">
-          <div>データ: ODPT 仙台市交通局 · 15秒更新</div>
-          <div>🔵 ズーム{STOP_MIN_ZOOM}以上でバス停表示</div>
+                        py-1.5 shadow border border-gray-100">
+          データ: ODPT 仙台市交通局 · 15秒更新
         </div>
       </div>
-
-      {/* approach panel */}
-      {selectedStop && (
-        <div className="absolute bottom-0 left-0 right-0 z-[1050]
-                        bg-white border-t border-gray-200 shadow-2xl rounded-t-2xl
-                        max-h-[55vh] flex flex-col">
-          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0">
-            <div className="flex items-center gap-2">
-              <span className="text-blue-500 text-lg">🚏</span>
-              <div>
-                <div className="font-bold text-gray-900 text-sm">{selectedStop.name}</div>
-                <div className="text-[10px] text-gray-400 font-mono">{selectedStop.id} · 次のバス</div>
-              </div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setSelectedStop(s => s ? { ...s } : null)}
-                title="再読み込み"
-                className="text-blue-400 hover:text-blue-600 text-sm px-1">↺</button>
-              <button onClick={() => { setSelectedStop(null); setArrivals([]); }}
-                className="text-gray-400 hover:text-gray-600 text-xl leading-none px-1">✕</button>
-            </div>
-          </div>
-
-          <div className="overflow-y-auto flex-1 divide-y divide-gray-50">
-            {approachLoading && (
-              <div className="flex items-center justify-center py-8 text-gray-400 text-sm gap-2">
-                <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
-                </svg>
-                取得中...
-              </div>
-            )}
-            {!approachLoading && arrivalError && (
-              <div className="px-4 py-6 text-center">
-                <div className="text-red-500 text-sm mb-1">エラー</div>
-                <div className="text-[11px] text-gray-400">{arrivalError}</div>
-              </div>
-            )}
-            {!approachLoading && !arrivalError && arrivals.length === 0 && (
-              <div className="px-4 py-6 text-center">
-                <div className="text-gray-400 text-sm mb-2">接近中のバスはありません</div>
-                {arrivalDebug && (
-                  <div className="text-[10px] text-gray-300 text-left bg-gray-50 rounded-lg p-2 space-y-1">
-                    <div>TripUpdate件数: {arrivalDebug.tripCount}</div>
-                    {arrivalDebug.sampleStopIds.length > 0 && (
-                      <div>フィード内のstopId例: <span className="font-mono">{arrivalDebug.sampleStopIds.join(', ')}</span></div>
-                    )}
-                  </div>
-                )}
-              </div>
-            )}
-            {!approachLoading && arrivals.map((arr, i) => {
-              const hue = routeHue(arr.routeId);
-              return (
-                <div key={i} className="flex items-center gap-3 px-4 py-3 hover:bg-gray-50">
-                  <div className="rounded-lg px-2.5 py-1 text-white text-xs font-bold min-w-[56px] text-center flex-shrink-0"
-                       style={{ background: `hsl(${hue},65%,48%)` }}>
-                    {arr.routeName}
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <div className="text-sm font-semibold text-gray-800 truncate">
-                      {arr.headsign || arr.routeLong || '-'}
-                    </div>
-                    {arr.routeLong && arr.headsign && (
-                      <div className="text-[10px] text-gray-400 truncate">{arr.routeLong}</div>
-                    )}
-                  </div>
-                  <div className="text-right flex-shrink-0">
-                    <div className={`text-sm font-bold ${arr.delay > 60 ? 'text-red-500' : 'text-blue-600'}`}>
-                      {relTime(arr.arrivalTime)}
-                    </div>
-                    <div className="text-[10px] text-gray-400">
-                      {new Date(arr.arrivalTime).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
-                      {arr.delay > 60 && (
-                        <span className="text-red-400 ml-1">+{Math.round(arr.delay / 60)}分遅</span>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
