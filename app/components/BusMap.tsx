@@ -32,16 +32,17 @@ function deadReckon(lat: number, lng: number, bear: number, spd: number, t: numb
 // ── route colour & name ───────────────────────────────────────────────────
 
 // Extract the short route number from a raw ID.
-// "odpt.Route:SendaiMunicipal.10" → "10"
-// "10"                            → "10"
-// "odpt.Trip:SendaiMunicipal.10.outbound.1" → "10" (first numeric-looking segment)
+// tripId format:  "10_1_1100029012:56:0020260414" → "10"
+// routeId format: "odpt.Route:SendaiMunicipal.10" → "10"
+// bare:           "10"                            → "10"
 function extractRouteNum(id?: string): string {
   if (!id) return '';
-  // Try splitting on . or : and find a short (≤6 char) non-empty segment that looks like a route number
+  // Pattern: "{route}_1_..." — route number is the first underscore segment
+  const firstSeg = id.split('_')[0];
+  if (/^\d{1,3}$/.test(firstSeg)) return firstSeg;
+  // Fallback: last segment after . or :
   const parts = id.split(/[.:]/);
-  // Prefer a segment that is purely numeric or alphanumeric and short
-  const candidate = parts.slice().reverse().find(p => p && p.length <= 6 && /^[A-Za-z0-9-]+$/.test(p));
-  return candidate ?? parts[parts.length - 1] ?? id;
+  return parts[parts.length - 1] ?? id;
 }
 
 function routeHue(routeId?: string, tripId?: string): number {
