@@ -1,68 +1,17 @@
 import { NextResponse } from 'next/server';
 import type { NextRequest } from 'next/server';
-import { inflateRawSync } from 'node:zlib';
 
 export const runtime = 'nodejs';
 export const revalidate = 0;
 
 const GTFS_URL = 'https://miyagi.dataeye.jp/resource_download/256';
 
-const GTFS_NAMES = new Set([
-  'agency.txt','stops.txt','routes.txt','trips.txt','stop_times.txt',
-  'calendar.txt','calendar_dates.txt','feed_info.txt','shapes.txt',
-  'fare_attributes.txt','fare_rules.txt','frequencies.txt','transfers.txt',
-  'translations.txt','attributions.txt','office_jp.txt','routes_jp.txt',
-]);
-
 function stripBom(buf: Uint8Array): Uint8Array {
   return (buf[0] === 0xEF && buf[1] === 0xBB && buf[2] === 0xBF) ? buf.slice(3) : buf;
 }
 
-interface CdEntry {
-  pos: number; name: string;
-  method: number; cSize: number; uSize: number; localOffset: number;
-}
-
-/** Scan the entire file for central-directory entries (PK\x01\x02) whose
- *  filename matches a known GTFS file. */
-function findCdEntries(data: Uint8Array): Record<string, CdEntry> {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const td   = new TextDecoder('utf-8');
-  const out: Record<string, CdEntry> = {};
-
-  for (let i = 0; i + 46 < data.length; i++) {
-    if (data[i]!==0x50 || data[i+1]!==0x4B || data[i+2]!==0x01 || data[i+3]!==0x02) continue;
-    const nameLen = view.getUint16(i + 28, true);
-    if (nameLen < 3 || nameLen > 40 || i + 46 + nameLen > data.length) continue;
-    const name = td.decode(data.slice(i + 46, i + 46 + nameLen));
-    if (!GTFS_NAMES.has(name)) continue;
-
-    out[name] = {
-      pos:         i,
-      name,
-      method:      view.getUint16(i + 10, true),
-      cSize:       view.getUint32(i + 20, true),
-      uSize:       view.getUint32(i + 24, true),
-      localOffset: view.getUint32(i + 42, true),
-    };
-  }
-  return out;
-}
-
-/** Scan the entire file for local-file headers (PK\x03\x04) whose
- *  filename matches a known GTFS file. Returns name → byte offset. */
-function findLocalHeaders(data: Uint8Array): Record<string, number> {
-  const td  = new TextDecoder('utf-8');
-  const out: Record<string, number> = {};
-
-  for (let i = 0; i + 30 < data.length; i++) {
-    if (data[i]!==0x50 || data[i+1]!==0x4B || data[i+2]!==0x03 || data[i+3]!==0x04) continue;
-    const nameLen = (data[i+26] | (data[i+27] << 8));
-    if (nameLen < 3 || nameLen > 40 || i + 30 + nameLen > data.length) continue;
-    const name = td.decode(data.slice(i + 30, i + 30 + nameLen));
-    if (GTFS_NAMES.has(name) && !(name in out)) out[name] = i;
-  }
-  return out;
+function hex(arr: Uint8Array, limit = 64): string {
+  return Array.from(arr.slice(0, limit)).map(b => b.toString(16).padStart(2, '0')).join(' ');
 }
 
 export async function GET(req: NextRequest) {
@@ -82,69 +31,71 @@ export async function GET(req: NextRequest) {
 
     const raw  = new Uint8Array(await res.arrayBuffer());
     const data = stripBom(raw);
-    const td   = new TextDecoder('utf-8');
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    const td   = new TextDecoder('utf-8', { fatal: false });
 
-    // Locate central-directory & local-header entries for GTFS files
-    const cdEntries    = findCdEntries(data);
-    const localHeaders = findLocalHeaders(data);
+    // ── Raw hex at key positions ──────────────────────────────────────
+    const first64  = hex(data, 64);
+    const at61k    = hex(data.slice(61210, 61280), 70);
+    const last64   = hex(data.slice(data.length - 64));
 
-    const cdNames    = Object.keys(cdEntries);
-    const localNames = Object.keys(localHeaders);
+    // ── Count ALL PK signatures ───────────────────────────────────────
+    let pk0304 = 0, pk0102 = 0, pk0506 = 0, pk0708 = 0;
+    for (let i = 0; i + 4 < data.length; i++) {
+      if (data[i] !== 0x50 || data[i+1] !== 0x4B) continue;
+      if (data[i+2] === 0x03 && data[i+3] === 0x04) pk0304++;
+      if (data[i+2] === 0x01 && data[i+3] === 0x02) pk0102++;
+      if (data[i+2] === 0x05 && data[i+3] === 0x06) pk0506++;
+      if (data[i+2] === 0x07 && data[i+3] === 0x08) pk0708++;
+    }
 
-    // Try to extract each GTFS file
-    const extracted: Record<string, string[]> = {};
-    const errors:    string[] = [];
-
-    for (const name of [...new Set([...cdNames, ...localNames])]) {
-      const cd       = cdEntries[name];
-      const localPos = localHeaders[name] ?? -1;
-
-      if (localPos < 0) {
-        errors.push(`${name}: CD found at pos=${cd?.pos} but no local header`);
+    // ── List first 15 PK\x03\x04 local headers (no name filter) ──────
+    const localHeaders: Array<{pos: number; name: string; nameHex: string; nameLen: number; cSize: number; method: number}> = [];
+    for (let i = 0; i + 30 < data.length && localHeaders.length < 15; i++) {
+      if (data[i]!==0x50 || data[i+1]!==0x4B || data[i+2]!==0x03 || data[i+3]!==0x04) continue;
+      const nameLen = (data[i+26] | (data[i+27] << 8));
+      const extraLen = (data[i+28] | (data[i+29] << 8));
+      const method  = view.getUint16(i + 8, true);
+      const cSize   = view.getUint32(i + 18, true);
+      if (nameLen > 256 || i + 30 + nameLen > data.length) {
+        localHeaders.push({ pos: i, name: '(nameLen too large or OOB)', nameHex: '', nameLen, cSize, method });
         continue;
       }
+      const nameBytes = data.slice(i + 30, i + 30 + nameLen);
+      const name      = td.decode(nameBytes);
+      const nameHex   = hex(nameBytes);
+      localHeaders.push({ pos: i, name, nameHex, nameLen, cSize, method });
+      // jump past local header to avoid re-scanning its data as another entry
+      i += 30 + nameLen + extraLen - 1;
+    }
 
-      // Parse local header to get dataStart
-      const localExtraLen = (data[localPos+28] | (data[localPos+29] << 8));
-      const localNameLen  = (data[localPos+26] | (data[localPos+27] << 8));
-      const dataStart     = localPos + 30 + localNameLen + localExtraLen;
-
-      // Prefer cSize from central directory (more reliable than local header)
-      const localCSize = new DataView(data.buffer, data.byteOffset).getUint32(localPos + 18, true);
-      const cSize      = (cd && cd.cSize > 0 && cd.cSize < data.length) ? cd.cSize : localCSize;
-      const method     = cd ? cd.method : (data[localPos+8] | (data[localPos+9] << 8));
-
-      if (cSize === 0) {
-        errors.push(`${name}: cSize=0 in both CD and local header`);
+    // ── List first 10 PK\x01\x02 CD entries (no name filter) ─────────
+    const cdHeaders: Array<{pos: number; name: string; nameLen: number; cSize: number; localOffset: number}> = [];
+    for (let i = 0; i + 46 < data.length && cdHeaders.length < 10; i++) {
+      if (data[i]!==0x50 || data[i+1]!==0x4B || data[i+2]!==0x01 || data[i+3]!==0x02) continue;
+      const nameLen = view.getUint16(i + 28, true);
+      const extraLen = view.getUint16(i + 30, true);
+      const commentLen = view.getUint16(i + 32, true);
+      const cSize      = view.getUint32(i + 20, true);
+      const localOffset = view.getUint32(i + 42, true);
+      if (nameLen > 256 || i + 46 + nameLen > data.length) {
+        cdHeaders.push({ pos: i, name: '(OOB)', nameLen, cSize, localOffset });
         continue;
       }
-      if (dataStart + cSize > data.length) {
-        errors.push(`${name}: out of bounds (dataStart=${dataStart}, cSize=${cSize}, fileLen=${data.length})`);
-        continue;
-      }
-
-      try {
-        const compressed = data.slice(dataStart, dataStart + cSize);
-        const raw2 = method === 0
-          ? compressed
-          : inflateRawSync(Buffer.from(compressed));
-        const text = td.decode(raw2);
-        extracted[name] = text.split('\n').slice(0, 4);
-      } catch (e) {
-        errors.push(`${name}: decompress err – ${e instanceof Error ? e.message : e}`);
-      }
+      const name = td.decode(data.slice(i + 46, i + 46 + nameLen));
+      cdHeaders.push({ pos: i, name, nameLen, cSize, localOffset });
+      i += 46 + nameLen + extraLen + commentLen - 1;
     }
 
     return NextResponse.json({
-      ok:         Object.keys(extracted).length > 0,
-      cdFound:    cdNames,
-      localFound: localNames,
-      cdDetails:  Object.fromEntries(
-        cdNames.map(n => [n, { pos: cdEntries[n].pos, cSize: cdEntries[n].cSize, localOffset: cdEntries[n].localOffset }])
-      ),
-      localPositions: localHeaders,
-      extracted,
-      errors,
+      totalBytes: data.length,
+      rawBomBytes: raw.length,
+      first64,
+      at61k,
+      last64,
+      pkCounts: { pk0304, pk0102, pk0506, pk0708 },
+      localHeaders,
+      cdHeaders,
     });
 
   } catch (e) {
