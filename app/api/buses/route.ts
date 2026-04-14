@@ -100,10 +100,8 @@ function parseProtobuf(feed: GtfsRealtimeBindings.transit_realtime.FeedMessage):
   });
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function parseJson(json: any): BusVehicle[] {
   if (!Array.isArray(json)) return [];
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return json.flatMap((entity: any) => {
     const vp  = entity.vehicle ?? entity;
     const pos = vp?.position   ?? vp?.Position;
