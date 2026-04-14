@@ -2,17 +2,16 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import type { BusVehicle } from '../api/buses/route';
-import type { GtfsStop } from '../../lib/gtfs-static';
+import type { GtfsRoute, GtfsStop, GtfsTrip } from '../../lib/gtfs-static';
 import type { Arrival } from '../api/trip-updates/route';
 import type { ServiceAlert } from '../api/alerts/route';
 
 const SENDAI_CENTER: [number, number] = [38.2682, 140.8694];
-const REFRESH_INTERVAL  = 15;
-const LERP_DURATION     = 1500;
-const DR_CAP_SEC        = 20;
-const DR_SPEED_FACTOR   = 0.65;
-const STOP_MIN_ZOOM     = 14;   // バス停マーカーを表示する最小ズーム
-const ALERT_REFRESH_MS  = 60_000;
+const REFRESH_INTERVAL = 15;
+const LERP_DURATION    = 1500;
+const DR_CAP_SEC       = 20;
+const DR_SPEED_FACTOR  = 0.65;
+const STOP_MIN_ZOOM    = 15;
 
 let L: typeof import('leaflet') | null = null;
 
@@ -20,25 +19,26 @@ let L: typeof import('leaflet') | null = null;
 function easeOutCubic(t: number) { return 1 - Math.pow(1 - t, 3); }
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
 function lerpAngle(a: number, b: number, t: number) {
-  const d = ((b - a + 540) % 360) - 180;
-  return (a + d * t + 360) % 360;
+  return (a + (((b - a + 540) % 360) - 180) * t + 360) % 360;
 }
 function toRad(d: number) { return d * Math.PI / 180; }
 function deadReckon(lat: number, lng: number, bear: number, spd: number, t: number): [number, number] {
   const s = Math.min(t, DR_CAP_SEC);
   const d = spd * DR_SPEED_FACTOR * s;
   const b = toRad(bear);
-  return [lat + (d * Math.cos(b)) / 111_111,
-          lng + (d * Math.sin(b)) / (111_111 * Math.cos(toRad(lat)))];
+  return [
+    lat + (d * Math.cos(b)) / 111_111,
+    lng + (d * Math.sin(b)) / (111_111 * Math.cos(toRad(lat))),
+  ];
 }
 
-// ── colour per route ──────────────────────────────────────────────────────
+// ── route colour ──────────────────────────────────────────────────────────
 function routeHue(routeId?: string) {
   if (!routeId) return 210;
   return Math.abs(routeId.split('').reduce((a, c) => a + c.charCodeAt(0), 0)) % 360;
 }
 
-// ── bus icon ──────────────────────────────────────────────────────────────
+// ── icons ─────────────────────────────────────────────────────────────────
 function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: string) {
   const h = routeHue(routeId);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
@@ -54,16 +54,14 @@ function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: str
     <rect x="9" y="23" width="3.5" height="2.5" rx="1" fill="hsl(${h},60%,28%)"/>
     <rect x="19.5" y="23" width="3.5" height="2.5" rx="1" fill="hsl(${h},60%,28%)"/>
   </svg>`;
-  return lf.divIcon({ html: svg, className: '', iconSize: [32,32], iconAnchor: [16,16], popupAnchor: [0,-18] });
+  return lf.divIcon({ html: svg, className: '', iconSize: [32, 32], iconAnchor: [16, 16], popupAnchor: [0, -18] });
 }
 
-// ── bus stop icon ─────────────────────────────────────────────────────────
 function getStopIcon(lf: typeof import('leaflet')) {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 18 18">
-    <circle cx="9" cy="9" r="7" fill="#2563eb" stroke="white" stroke-width="2"/>
-    <text x="9" y="13" text-anchor="middle" font-size="9" font-weight="bold" fill="white" font-family="sans-serif">S</text>
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+    <circle cx="8" cy="8" r="6" fill="#2563eb" stroke="white" stroke-width="2"/>
   </svg>`;
-  return lf.divIcon({ html: svg, className: '', iconSize: [18,18], iconAnchor: [9,9], popupAnchor: [0,-12] });
+  return lf.divIcon({ html: svg, className: '', iconSize: [16, 16], iconAnchor: [8, 8] });
 }
 
 // ── popup ─────────────────────────────────────────────────────────────────
@@ -71,30 +69,42 @@ function formatTime(ts?: number) {
   if (!ts) return '-';
   return new Date(ts).toLocaleTimeString('ja-JP');
 }
-function buildBusPopup(bus: BusVehicle) {
-  const routeDisplay = bus.routeShort
-    ? `${bus.routeShort}系統${bus.routeLong ? `<br><span style="font-size:10px;color:#6b7280">${bus.routeLong}</span>` : ''}`
-    : (bus.routeId ?? '-');
-  const rows: [string,string][] = [
-    ['車両',  bus.vehicleLabel ?? bus.id],
-    ['路線',  routeDisplay],
-    ['行先',  bus.headsign ?? '-'],
-    ['速度',  bus.speed  != null ? `${bus.speed} km/h` : '-'],
-    ['状態',  bus.currentStatus ?? '-'],
-    ['更新',  formatTime(bus.timestamp)],
+
+function buildBusPopup(
+  bus: BusVehicle,
+  routes: Record<string, GtfsRoute>,
+  trips: Record<string, GtfsTrip>,
+): string {
+  const route    = bus.routeId ? routes[bus.routeId] : undefined;
+  const trip     = bus.tripId  ? trips[bus.tripId]   : undefined;
+  const h        = routeHue(bus.routeId);
+  const routeNum = route?.shortName || bus.routeId || '-';
+  const routeLong = route?.longName || '';
+  const headsign  = trip?.headsign  || '';
+
+  const routeCell = `${routeNum}系統${routeLong ? `<br><span style="font-size:10px;color:#6b7280;font-weight:400">${routeLong}</span>` : ''}`;
+  const rows: [string, string][] = [
+    ['車両', bus.vehicleLabel ?? bus.id],
+    ['路線', routeCell],
+    ['行先', headsign || '-'],
+    ['速度', bus.speed  != null ? `${bus.speed} km/h` : '-'],
+    ['状態', bus.currentStatus ?? '-'],
+    ['更新', formatTime(bus.timestamp)],
   ];
-  const rowsHtml = rows.map(([l,v]) => `<tr>
-    <td style="color:#6b7280;padding:2px 10px 2px 0;font-size:11px;white-space:nowrap">${l}</td>
-    <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
-  </tr>`).join('');
-  return `<div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:190px;
+  const rowsHtml = rows.map(([l, v]) =>
+    `<tr>
+      <td style="color:#6b7280;padding:2px 10px 2px 0;font-size:11px;white-space:nowrap">${l}</td>
+      <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
+    </tr>`
+  ).join('');
+  return `<div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:195px;
     font-family:system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.15)">
-    <div style="font-weight:700;font-size:13px;margin-bottom:7px;color:hsl(${routeHue(bus.routeId)},70%,40%)">🚌 バス情報</div>
+    <div style="font-weight:700;font-size:13px;margin-bottom:7px;color:hsl(${h},65%,40%)">🚌 バス情報</div>
     <table style="border-collapse:collapse;width:100%">${rowsHtml}</table>
   </div>`;
 }
 
-// ── interfaces ────────────────────────────────────────────────────────────
+// ── internal types ────────────────────────────────────────────────────────
 interface LerpTask {
   fromLat: number; fromLng: number; toLat: number; toLng: number;
   fromBearing: number; toBearing: number; startTime: number;
@@ -108,39 +118,44 @@ interface SelectedStop { id: string; name: string; }
 
 // ── component ─────────────────────────────────────────────────────────────
 export default function BusMap() {
-  const mapRef        = useRef<import('leaflet').Map | null>(null);
-  const markersRef    = useRef<Map<string, import('leaflet').Marker>>(new Map());
-  const bearingsRef   = useRef<Map<string, number>>(new Map());
-  const containerRef  = useRef<HTMLDivElement>(null);
-  const lerpTasksRef  = useRef<Map<string, LerpTask>>(new Map());
-  const drRef         = useRef<Map<string, DrAnchor>>(new Map());
-  const rafRef        = useRef<number | null>(null);
-  const stopLayerRef  = useRef<import('leaflet').LayerGroup | null>(null);
+  const mapRef       = useRef<import('leaflet').Map | null>(null);
+  const markersRef   = useRef<Map<string, import('leaflet').Marker>>(new Map());
+  const bearingsRef  = useRef<Map<string, number>>(new Map());
+  const busDataRef   = useRef<Map<string, BusVehicle>>(new Map());
+  const containerRef = useRef<HTMLDivElement>(null);
+  const lerpRef      = useRef<Map<string, LerpTask>>(new Map());
+  const drRef        = useRef<Map<string, DrAnchor>>(new Map());
+  const rafRef       = useRef<number | null>(null);
+  const stopLayerRef = useRef<import('leaflet').LayerGroup | null>(null);
+  const drEnabledRef = useRef(true);
+  const countdownRef = useRef(REFRESH_INTERVAL);
+  const timerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const drEnabledRef  = useRef(true);
-  const countdownRef  = useRef(REFRESH_INTERVAL);
-  const timerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // GTFS static — stored in refs so popup builder always reads latest
+  const gtfsRoutesRef = useRef<Record<string, GtfsRoute>>({});
+  const gtfsTripsRef  = useRef<Record<string, GtfsTrip>>({});
 
-  const [status,        setStatus]        = useState<'loading'|'ok'|'error'>('loading');
-  const [busCount,      setBusCount]      = useState(0);
-  const [lastUpdate,    setLastUpdate]    = useState('');
-  const [errorMsg,      setErrorMsg]      = useState('');
-  const [countdown,     setCountdown]     = useState(REFRESH_INTERVAL);
-  const [drEnabled,     setDrEnabled]     = useState(true);
-  const [alerts,        setAlerts]        = useState<ServiceAlert[]>([]);
-  const [dismissAlerts, setDismissAlerts] = useState(false);
-  const [selectedStop,  setSelectedStop]  = useState<SelectedStop | null>(null);
-  const [arrivals,      setArrivals]      = useState<Arrival[]>([]);
+  const [status,          setStatus]          = useState<'loading' | 'ok' | 'error'>('loading');
+  const [busCount,        setBusCount]        = useState(0);
+  const [lastUpdate,      setLastUpdate]      = useState('');
+  const [errorMsg,        setErrorMsg]        = useState('');
+  const [countdown,       setCountdown]       = useState(REFRESH_INTERVAL);
+  const [drEnabled,       setDrEnabled]       = useState(true);
+  const [gtfsReady,       setGtfsReady]       = useState(false);
+  const [alerts,          setAlerts]          = useState<ServiceAlert[]>([]);
+  const [dismissAlerts,   setDismissAlerts]   = useState(false);
+  const [selectedStop,    setSelectedStop]    = useState<SelectedStop | null>(null);
+  const [arrivals,        setArrivals]        = useState<Arrival[]>([]);
   const [approachLoading, setApproachLoading] = useState(false);
 
-  // ── RAF loop ─────────────────────────────────────────────────────────────
+  // ── RAF loop ──────────────────────────────────────────────────────────
   const startRaf = useCallback(() => {
     if (rafRef.current != null) return;
     const loop = () => {
       const now = performance.now();
       let active = false;
 
-      for (const [id, task] of lerpTasksRef.current) {
+      for (const [id, task] of lerpRef.current) {
         const t = Math.min((now - task.startTime) / LERP_DURATION, 1);
         const e = easeOutCubic(t);
         const marker = markersRef.current.get(id);
@@ -152,7 +167,7 @@ export default function BusMap() {
         }
         if (t < 1) { active = true; }
         else {
-          lerpTasksRef.current.delete(id);
+          lerpRef.current.delete(id);
           const dr = drRef.current.get(id);
           if (dr) { dr.lat = task.toLat; dr.lng = task.toLng; dr.time = now; }
         }
@@ -160,10 +175,12 @@ export default function BusMap() {
 
       if (drEnabledRef.current) {
         for (const [id, dr] of drRef.current) {
-          if (lerpTasksRef.current.has(id) || dr.speedMs <= 0) continue;
+          if (lerpRef.current.has(id) || dr.speedMs <= 0) continue;
           const elapsed = (now - dr.time) / 1000;
           if (elapsed >= DR_CAP_SEC) continue;
-          markersRef.current.get(id)?.setLatLng(deadReckon(dr.lat, dr.lng, dr.bearingDeg, dr.speedMs, elapsed));
+          markersRef.current.get(id)?.setLatLng(
+            deadReckon(dr.lat, dr.lng, dr.bearingDeg, dr.speedMs, elapsed)
+          );
           active = true;
         }
       }
@@ -173,7 +190,7 @@ export default function BusMap() {
     rafRef.current = requestAnimationFrame(loop);
   }, []);
 
-  // ── fetch buses ───────────────────────────────────────────────────────────
+  // ── fetch buses ───────────────────────────────────────────────────────
   const fetchBuses = useCallback(async () => {
     if (!mapRef.current || !L) return;
     try {
@@ -185,36 +202,53 @@ export default function BusMap() {
       const existingIds = new Set(markersRef.current.keys());
 
       for (const bus of data.vehicles) {
-        const newBearing = bus.bearing ?? 0;
+        const newBearing = bus.bearing  ?? 0;
         const newSpeedMs = (bus.speed ?? 0) / 3.6;
-        const popup      = buildBusPopup(bus);
+        busDataRef.current.set(bus.id, bus);
 
         if (markersRef.current.has(bus.id)) {
           const marker      = markersRef.current.get(bus.id)!;
           const cur         = marker.getLatLng();
           const fromBearing = bearingsRef.current.get(bus.id) ?? newBearing;
-          drRef.current.set(bus.id, { lat: bus.lat, lng: bus.lon, bearingDeg: newBearing, speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId });
-          lerpTasksRef.current.set(bus.id, { fromLat: cur.lat, fromLng: cur.lng, toLat: bus.lat, toLng: bus.lon, fromBearing, toBearing: newBearing, startTime: performance.now() });
-          marker.getPopup()?.setContent(popup);
+          drRef.current.set(bus.id, {
+            lat: bus.lat, lng: bus.lon, bearingDeg: newBearing,
+            speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId,
+          });
+          lerpRef.current.set(bus.id, {
+            fromLat: cur.lat, fromLng: cur.lng, toLat: bus.lat, toLng: bus.lon,
+            fromBearing, toBearing: newBearing, startTime: performance.now(),
+          });
           existingIds.delete(bus.id);
           startRaf();
         } else {
-          const marker = lf.marker([bus.lat, bus.lon], { icon: getBusIcon(lf, newBearing, bus.routeId) })
-            .bindPopup(popup, { maxWidth: 280 })
+          const icon = getBusIcon(lf, newBearing, bus.routeId);
+          // popup uses a function so it always reads the latest GTFS refs
+          const marker = lf.marker([bus.lat, bus.lon], { icon })
+            .bindPopup(() => buildBusPopup(
+              busDataRef.current.get(bus.id) ?? bus,
+              gtfsRoutesRef.current,
+              gtfsTripsRef.current,
+            ), { maxWidth: 280 })
             .addTo(mapRef.current!);
           markersRef.current.set(bus.id, marker);
           bearingsRef.current.set(bus.id, newBearing);
-          drRef.current.set(bus.id, { lat: bus.lat, lng: bus.lon, bearingDeg: newBearing, speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId });
+          drRef.current.set(bus.id, {
+            lat: bus.lat, lng: bus.lon, bearingDeg: newBearing,
+            speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId,
+          });
           if (newSpeedMs > 0) startRaf();
         }
       }
+
       for (const oldId of existingIds) {
         markersRef.current.get(oldId)?.remove();
         markersRef.current.delete(oldId);
         bearingsRef.current.delete(oldId);
-        lerpTasksRef.current.delete(oldId);
+        busDataRef.current.delete(oldId);
+        lerpRef.current.delete(oldId);
         drRef.current.delete(oldId);
       }
+
       setBusCount(data.count);
       setLastUpdate(formatTime(data.fetchedAt));
       setStatus('ok');
@@ -225,58 +259,69 @@ export default function BusMap() {
     }
   }, [startRaf]);
 
-  // ── fetch stops (GTFS static) ─────────────────────────────────────────────
-  const loadStops = useCallback(async (map: import('leaflet').Map, lf: typeof import('leaflet')) => {
+  // ── load GTFS static (stops + routes) ────────────────────────────────
+  const loadGtfsStatic = useCallback(async (
+    map: import('leaflet').Map,
+    lf: typeof import('leaflet'),
+  ) => {
     try {
-      const res  = await fetch('/api/gtfs-static');
+      const res = await fetch('/api/gtfs-static');
       if (!res.ok) return;
-      const data: { stops: GtfsStop[] } = await res.json();
+      const data: {
+        routes: Record<string, GtfsRoute>;
+        stops:  GtfsStop[];
+        trips:  Record<string, GtfsTrip>;
+      } = await res.json();
 
-      const layer = lf.layerGroup().addTo(map);
+      gtfsRoutesRef.current = data.routes ?? {};
+      gtfsTripsRef.current  = data.trips  ?? {};
+      setGtfsReady(true);
+
+      // ── stop markers ──
+      if (!data.stops?.length) return;
+      const layer    = lf.layerGroup();
       stopLayerRef.current = layer;
       const stopIcon = getStopIcon(lf);
 
       for (const stop of data.stops) {
-        const marker = lf.marker([stop.lat, stop.lon], { icon: stopIcon })
-          .bindTooltip(stop.name, { direction: 'top', offset: [0, -10], opacity: 0.9 });
-        marker.on('click', () => {
-          setSelectedStop({ id: stop.id, name: stop.name });
-        });
-        layer.addLayer(marker);
+        const m = lf.marker([stop.lat, stop.lon], { icon: stopIcon });
+        m.bindTooltip(stop.name, { direction: 'top', offset: [0, -10], opacity: 0.9 });
+        m.on('click', () => setSelectedStop({ id: stop.id, name: stop.name }));
+        layer.addLayer(m);
       }
 
-      // ズームに応じて表示切替
-      const toggleStops = () => {
-        if (map.getZoom() >= STOP_MIN_ZOOM) layer.addTo(map);
-        else layer.remove();
+      const sync = () => {
+        if (map.getZoom() >= STOP_MIN_ZOOM) { if (!map.hasLayer(layer)) layer.addTo(map); }
+        else                                { if (map.hasLayer(layer))  layer.remove(); }
       };
-      map.on('zoomend', toggleStops);
-      toggleStops();
-    } catch { /* stops are optional */ }
+      map.on('zoomend', sync);
+      sync();
+    } catch { /* GTFS static optional — buses still work */ }
   }, []);
 
-  // ── fetch approach times ──────────────────────────────────────────────────
+  // ── fetch approach times ──────────────────────────────────────────────
   useEffect(() => {
     if (!selectedStop) return;
     setApproachLoading(true);
     setArrivals([]);
     fetch(`/api/trip-updates?stopId=${encodeURIComponent(selectedStop.id)}`)
       .then(r => r.json())
-      .then(d => { setArrivals(d.arrivals ?? []); })
-      .catch(() => { setArrivals([]); })
+      .then(d => setArrivals(d.arrivals ?? []))
+      .catch(() => setArrivals([]))
       .finally(() => setApproachLoading(false));
   }, [selectedStop]);
 
-  // ── fetch alerts ──────────────────────────────────────────────────────────
+  // ── fetch alerts ──────────────────────────────────────────────────────
   const fetchAlerts = useCallback(async () => {
     try {
       const r = await fetch('/api/alerts');
       const d = await r.json();
       if (d.alerts?.length) { setAlerts(d.alerts); setDismissAlerts(false); }
+      else                  { setAlerts([]); }
     } catch { /* ignore */ }
   }, []);
 
-  // ── map init ──────────────────────────────────────────────────────────────
+  // ── map init ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (mapRef.current || !containerRef.current) return;
     (async () => {
@@ -288,30 +333,36 @@ export default function BusMap() {
         maxZoom: 19,
       }).addTo(map);
       mapRef.current = map;
-      await fetchBuses();
-      await loadStops(map, lf);
-      await fetchAlerts();
-    })();
-  }, [fetchBuses, loadStops, fetchAlerts]);
 
-  // ── countdown + auto-refresh ──────────────────────────────────────────────
+      // bus positions first (fast), then GTFS static in background
+      await fetchBuses();
+      loadGtfsStatic(map, lf);  // non-blocking
+      fetchAlerts();
+    })();
+  }, [fetchBuses, loadGtfsStatic, fetchAlerts]);
+
+  // ── countdown ─────────────────────────────────────────────────────────
   useEffect(() => {
     const tick = () => {
       countdownRef.current -= 1;
       setCountdown(countdownRef.current);
-      if (countdownRef.current <= 0) { countdownRef.current = REFRESH_INTERVAL; fetchBuses(); }
+      if (countdownRef.current <= 0) {
+        countdownRef.current = REFRESH_INTERVAL;
+        fetchBuses();
+      }
       timerRef.current = setTimeout(tick, 1000);
     };
     timerRef.current = setTimeout(tick, 1000);
     return () => { if (timerRef.current) clearTimeout(timerRef.current); };
   }, [fetchBuses]);
 
-  // ── alert periodic refresh ────────────────────────────────────────────────
+  // ── alert refresh ─────────────────────────────────────────────────────
   useEffect(() => {
-    const id = setInterval(fetchAlerts, ALERT_REFRESH_MS);
+    const id = setInterval(fetchAlerts, 60_000);
     return () => clearInterval(id);
   }, [fetchAlerts]);
 
+  // ── handlers ──────────────────────────────────────────────────────────
   const handleRefresh = () => {
     countdownRef.current = REFRESH_INTERVAL;
     setCountdown(REFRESH_INTERVAL);
@@ -324,7 +375,8 @@ export default function BusMap() {
     drEnabledRef.current = next;
     setDrEnabled(next);
     if (!next) {
-      for (const [id, dr] of drRef.current) markersRef.current.get(id)?.setLatLng([dr.lat, dr.lng]);
+      for (const [id, dr] of drRef.current)
+        markersRef.current.get(id)?.setLatLng([dr.lat, dr.lng]);
     } else {
       const now = performance.now();
       for (const dr of drRef.current.values()) dr.time = now;
@@ -332,41 +384,51 @@ export default function BusMap() {
     }
   };
 
-  // ── relative time helper ──────────────────────────────────────────────────
   function relTime(ms: number) {
-    const diff = Math.round((ms - Date.now()) / 1000);
-    if (diff <= 0)  return 'まもなく';
-    if (diff < 60)  return `約${diff}秒後`;
-    return `約${Math.round(diff / 60)}分後`;
+    const s = Math.round((ms - Date.now()) / 1000);
+    if (s <= 0)  return 'まもなく';
+    if (s < 60)  return `約${s}秒後`;
+    return `約${Math.round(s / 60)}分後`;
   }
 
-  // ── render ────────────────────────────────────────────────────────────────
+  const alertOffset = alerts.length > 0 && !dismissAlerts;
+
+  // ── render ────────────────────────────────────────────────────────────
   return (
     <div className="relative w-full h-full">
       <div ref={containerRef} className="w-full h-full" />
 
-      {/* ── alert banner ── */}
-      {alerts.length > 0 && !dismissAlerts && (
-        <div className="absolute top-0 left-0 right-0 z-[1100] bg-amber-50 border-b border-amber-300 px-4 py-2 flex items-start gap-3">
-          <span className="text-amber-600 text-sm mt-0.5">⚠️</span>
+      {/* alert banner */}
+      {alertOffset && (
+        <div className="absolute top-0 left-0 right-0 z-[1100]
+                        bg-amber-50 border-b border-amber-200 px-4 py-2
+                        flex items-start gap-3">
+          <span className="text-amber-500 text-sm mt-0.5 flex-shrink-0">⚠️</span>
           <div className="flex-1 text-xs text-amber-800 space-y-0.5">
             {alerts.map(a => (
-              <div key={a.id}><span className="font-bold">[{a.effect}]</span> {a.header}</div>
+              <div key={a.id}>
+                <span className="font-bold">[{a.effect}]</span> {a.header}
+              </div>
             ))}
           </div>
-          <button onClick={() => setDismissAlerts(true)} className="text-amber-500 hover:text-amber-700 text-sm leading-none">✕</button>
+          <button onClick={() => setDismissAlerts(true)}
+            className="text-amber-400 hover:text-amber-600 text-sm flex-shrink-0">✕</button>
         </div>
       )}
 
-      {/* ── header ── */}
-      <div className={`absolute left-1/2 -translate-x-1/2 z-[1000] pointer-events-none ${alerts.length > 0 && !dismissAlerts ? 'top-10' : 'top-3'}`}>
-        <div className="bg-white/92 backdrop-blur-sm text-gray-800 rounded-xl px-5 py-2.5 shadow-lg
+      {/* header */}
+      <div className={`absolute left-1/2 -translate-x-1/2 z-[1000] pointer-events-none
+                       ${alertOffset ? 'top-10' : 'top-3'}`}>
+        <div className="bg-white/92 backdrop-blur-sm rounded-xl px-5 py-2.5 shadow-lg
                         flex items-center gap-4 pointer-events-auto border border-gray-200">
           <div className="flex items-center gap-2">
             <span className="text-xl">🚌</span>
             <div>
-              <div className="text-sm font-bold leading-tight text-gray-900">仙台市バス リアルタイムマップ</div>
-              <div className="text-[10px] text-gray-500 leading-tight">Sendai Municipal Bus Live Tracker</div>
+              <div className="text-sm font-bold text-gray-900 leading-tight">仙台市バス リアルタイムマップ</div>
+              <div className="text-[10px] text-gray-400 leading-tight">
+                Sendai Municipal Bus Live Tracker
+                {gtfsReady && <span className="ml-1 text-green-500">· 路線名読込済</span>}
+              </div>
             </div>
           </div>
           <div className="h-8 w-px bg-gray-200" />
@@ -391,7 +453,7 @@ export default function BusMap() {
         </div>
       </div>
 
-      {/* ── bottom-right controls ── */}
+      {/* controls */}
       <div className="absolute bottom-6 right-3 z-[1000] flex flex-col gap-2 items-end">
         <button onClick={handleRefresh}
           className="bg-white/92 backdrop-blur-sm text-gray-700 text-xs rounded-lg px-3 py-2
@@ -405,30 +467,28 @@ export default function BusMap() {
         <button onClick={handleToggleDr}
           className={`backdrop-blur-sm text-xs rounded-lg px-3 py-2 shadow-md transition
                       flex items-center gap-1.5 border
-                      ${drEnabled ? 'bg-blue-500 text-white border-blue-400 hover:bg-blue-600'
-                                  : 'bg-white/92 text-gray-500 border-gray-200 hover:bg-white'}`}>
-          <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-              d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"/>
-          </svg>
+                      ${drEnabled
+                        ? 'bg-blue-500 text-white border-blue-400 hover:bg-blue-600'
+                        : 'bg-white/92 text-gray-500 border-gray-200 hover:bg-white'}`}>
           推算移動: {drEnabled ? 'ON' : 'OFF'}
         </button>
-        <div className="bg-white/85 backdrop-blur-sm text-gray-500 text-[11px] rounded-lg px-3 py-1.5 shadow border border-gray-100">
+        <div className="bg-white/85 backdrop-blur-sm text-gray-500 text-[11px] rounded-lg px-3
+                        py-1.5 shadow border border-gray-100">
           次回更新: {countdown}秒後
         </div>
-        <div className="bg-white/80 backdrop-blur-sm text-gray-400 text-[10px] rounded-lg px-3 py-1.5 shadow border border-gray-100 leading-relaxed">
+        <div className="bg-white/80 backdrop-blur-sm text-gray-400 text-[10px] rounded-lg px-3
+                        py-1.5 shadow border border-gray-100 leading-relaxed">
           <div>データ: ODPT 仙台市交通局 · 15秒更新</div>
-          <div className="text-blue-400">🔵 ズーム14以上でバス停表示</div>
+          <div>🔵 ズーム{STOP_MIN_ZOOM}以上でバス停表示</div>
         </div>
       </div>
 
-      {/* ── approach panel ── */}
+      {/* approach panel */}
       {selectedStop && (
         <div className="absolute bottom-0 left-0 right-0 z-[1050]
                         bg-white border-t border-gray-200 shadow-2xl rounded-t-2xl
                         max-h-[55vh] flex flex-col">
-          {/* panel header */}
-          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 flex-shrink-0">
             <div className="flex items-center gap-2">
               <span className="text-blue-500 text-lg">🚏</span>
               <div>
@@ -436,14 +496,10 @@ export default function BusMap() {
                 <div className="text-[10px] text-gray-400">次のバス</div>
               </div>
             </div>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => { setSelectedStop(null); setArrivals([]); }}
-                className="text-gray-400 hover:text-gray-600 text-lg leading-none px-1">✕</button>
-            </div>
+            <button onClick={() => { setSelectedStop(null); setArrivals([]); }}
+              className="text-gray-400 hover:text-gray-600 text-xl leading-none px-1">✕</button>
           </div>
 
-          {/* arrival list */}
           <div className="overflow-y-auto flex-1 divide-y divide-gray-50">
             {approachLoading && (
               <div className="flex items-center justify-center py-8 text-gray-400 text-sm gap-2">
@@ -463,12 +519,10 @@ export default function BusMap() {
               const hue = routeHue(arr.routeId);
               return (
                 <div key={i} className="flex items-center gap-3 px-4 py-3 hover:bg-gray-50">
-                  {/* route badge */}
-                  <div className="rounded-lg px-2.5 py-1 text-white text-xs font-bold min-w-[52px] text-center"
+                  <div className="rounded-lg px-2.5 py-1 text-white text-xs font-bold min-w-[56px] text-center flex-shrink-0"
                        style={{ background: `hsl(${hue},65%,48%)` }}>
                     {arr.routeName}
                   </div>
-                  {/* destination */}
                   <div className="flex-1 min-w-0">
                     <div className="text-sm font-semibold text-gray-800 truncate">
                       {arr.headsign || arr.routeLong || '-'}
@@ -477,14 +531,15 @@ export default function BusMap() {
                       <div className="text-[10px] text-gray-400 truncate">{arr.routeLong}</div>
                     )}
                   </div>
-                  {/* arrival time */}
                   <div className="text-right flex-shrink-0">
                     <div className={`text-sm font-bold ${arr.delay > 60 ? 'text-red-500' : 'text-blue-600'}`}>
                       {relTime(arr.arrivalTime)}
                     </div>
                     <div className="text-[10px] text-gray-400">
-                      {new Date(arr.arrivalTime).toLocaleTimeString('ja-JP', { hour:'2-digit', minute:'2-digit' })}
-                      {arr.delay > 0 && <span className="text-red-400 ml-1">+{Math.round(arr.delay/60)}分遅</span>}
+                      {new Date(arr.arrivalTime).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' })}
+                      {arr.delay > 60 && (
+                        <span className="text-red-400 ml-1">+{Math.round(arr.delay / 60)}分遅</span>
+                      )}
                     </div>
                   </div>
                 </div>

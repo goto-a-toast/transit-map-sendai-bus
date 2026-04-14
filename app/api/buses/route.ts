@@ -1,23 +1,19 @@
 import { NextResponse } from 'next/server';
 import GtfsRealtimeBindings from 'gtfs-realtime-bindings';
-import { getGtfsStaticCached } from '../../../lib/gtfs-static';
 
 export const runtime = 'nodejs';
 export const revalidate = 0;
 
 export interface BusVehicle {
-  id: string;
-  lat: number;
-  lon: number;
-  bearing?: number;
-  speed?: number;         // km/h
-  tripId?: string;
-  routeId?: string;
-  routeShort?: string;   // e.g. "10"
-  routeLong?: string;    // e.g. "泉中央駅前〜仙台駅前"
-  headsign?: string;     // 行先
+  id:            string;
+  lat:           number;
+  lon:           number;
+  bearing?:      number;
+  speed?:        number;  // km/h
+  tripId?:       string;
+  routeId?:      string;
   vehicleLabel?: string;
-  timestamp?: number;
+  timestamp?:    number;
   currentStatus?: string;
 }
 
@@ -34,89 +30,69 @@ export async function GET() {
     return NextResponse.json({ error: 'APIキーが設定されていません' }, { status: 500 });
   }
 
-  const vehicleUrl =
+  const url =
     `https://api-public.odpt.org/api/v4/gtfs/realtime/odpt_SendaiMunicipal_bus_realtime_information_vehicle?acl:consumerKey=${apiKey}`;
 
-  // 車両位置 + GTFSスタティックを並行取得
-  const [vehicleRes, gtfs] = await Promise.all([
-    fetch(vehicleUrl, {
+  let res: Response;
+  try {
+    res = await fetch(url, {
       headers: { Accept: 'application/x-protobuf, application/octet-stream, */*' },
       cache: 'no-store',
-    }).catch(() => null),
-    getGtfsStaticCached(apiKey).catch(() => null),
-  ]);
-
-  if (!vehicleRes?.ok) {
+    });
+  } catch (err) {
     return NextResponse.json(
-      { error: `APIエラー: ${vehicleRes?.status ?? 500}` },
-      { status: vehicleRes?.status ?? 500 },
+      { error: err instanceof Error ? err.message : 'ネットワークエラー' },
+      { status: 500 },
+    );
+  }
+
+  if (!res.ok) {
+    return NextResponse.json(
+      { error: `APIエラー: ${res.status} ${res.statusText}` },
+      { status: res.status },
     );
   }
 
   try {
-    const contentType = vehicleRes.headers.get('content-type') ?? '';
-    const buf         = Buffer.from(await vehicleRes.arrayBuffer());
+    const contentType = res.headers.get('content-type') ?? '';
+    const buf         = Buffer.from(await res.arrayBuffer());
+
     let vehicles: BusVehicle[] = [];
 
     if (contentType.includes('json')) {
-      vehicles = parseJsonResponse(JSON.parse(buf.toString('utf-8')), gtfs);
+      vehicles = parseJson(JSON.parse(buf.toString('utf-8')));
     } else {
       try {
         const feed = GtfsRealtimeBindings.transit_realtime.FeedMessage.decode(buf);
-        vehicles = parseProtobufFeed(feed, gtfs);
+        vehicles = parseProtobuf(feed);
       } catch {
-        try {
-          vehicles = parseJsonResponse(JSON.parse(buf.toString('utf-8')), gtfs);
-        } catch {
-          return NextResponse.json({ error: 'レスポンスのパースに失敗しました' }, { status: 500 });
-        }
+        try { vehicles = parseJson(JSON.parse(buf.toString('utf-8'))); } catch { /* ignore */ }
       }
     }
 
     return NextResponse.json({ vehicles, count: vehicles.length, fetchedAt: Date.now() });
   } catch (err) {
     return NextResponse.json(
-      { error: err instanceof Error ? err.message : '不明なエラー' },
+      { error: err instanceof Error ? err.message : '解析エラー' },
       { status: 500 },
     );
   }
 }
 
-type GtfsCache = Awaited<ReturnType<typeof getGtfsStaticCached>> | null;
-
-function enrichRoute(routeId: string | undefined, tripId: string | undefined, gtfs: GtfsCache) {
-  if (!gtfs || !routeId) return { routeShort: undefined, routeLong: undefined, headsign: undefined };
-  const route   = gtfs.routes[routeId];
-  const headsign = tripId ? (gtfs.trips[tripId]?.headsign ?? undefined) : undefined;
-  return {
-    routeShort: route?.shortName || (routeId ? routeId : undefined),
-    routeLong:  route?.longName  || undefined,
-    headsign,
-  };
-}
-
-function parseProtobufFeed(
-  feed: GtfsRealtimeBindings.transit_realtime.FeedMessage,
-  gtfs: GtfsCache,
-): BusVehicle[] {
+function parseProtobuf(feed: GtfsRealtimeBindings.transit_realtime.FeedMessage): BusVehicle[] {
   return feed.entity.flatMap(entity => {
     const vp = entity.vehicle;
     if (!vp?.position) return [];
     const { latitude: lat, longitude: lon } = vp.position;
     if (!lat || !lon) return [];
-
     const statusNum = vp.currentStatus != null ? (vp.currentStatus as unknown as number) : undefined;
-    const routeId   = vp.trip?.routeId ?? undefined;
-    const tripId    = vp.trip?.tripId  ?? undefined;
-
     return [{
       id:            entity.id,
       lat, lon,
       bearing:       vp.position.bearing ?? undefined,
       speed:         vp.position.speed   != null ? Math.round(vp.position.speed * 3.6) : undefined,
-      tripId,
-      routeId,
-      ...enrichRoute(routeId, tripId, gtfs),
+      tripId:        vp.trip?.tripId     ?? undefined,
+      routeId:       vp.trip?.routeId   ?? undefined,
       vehicleLabel:  vp.vehicle?.label  ?? undefined,
       timestamp:     vp.timestamp != null ? Number(vp.timestamp) * 1000 : undefined,
       currentStatus: statusNum    != null ? STATUS_LABELS[statusNum] : undefined,
@@ -125,7 +101,7 @@ function parseProtobufFeed(
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function parseJsonResponse(json: any, gtfs: GtfsCache): BusVehicle[] {
+function parseJson(json: any): BusVehicle[] {
   if (!Array.isArray(json)) return [];
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return json.flatMap((entity: any) => {
@@ -135,15 +111,13 @@ function parseJsonResponse(json: any, gtfs: GtfsCache): BusVehicle[] {
     const lat = pos.latitude  ?? pos.Latitude;
     const lon = pos.longitude ?? pos.Longitude;
     if (!lat || !lon) return [];
-    const routeId = vp.trip?.routeId ?? vp.Trip?.RouteId;
-    const tripId  = vp.trip?.tripId  ?? vp.Trip?.TripId;
     return [{
-      id:            entity.id ?? entity.Id ?? String(Math.random()),
+      id:            entity.id ?? String(Math.random()),
       lat, lon,
       bearing:       pos.bearing ?? pos.Bearing,
       speed:         pos.speed   ?? pos.Speed,
-      routeId, tripId,
-      ...enrichRoute(routeId, tripId, gtfs),
+      tripId:        vp.trip?.tripId  ?? vp.Trip?.TripId,
+      routeId:       vp.trip?.routeId ?? vp.Trip?.RouteId,
       vehicleLabel:  vp.vehicle?.label ?? vp.Vehicle?.Label,
       timestamp:     vp.timestamp ? Number(vp.timestamp) * 1000 : undefined,
       currentStatus: vp.currentStatus,

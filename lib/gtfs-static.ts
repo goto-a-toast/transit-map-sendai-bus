@@ -51,7 +51,16 @@ export async function getGtfsStaticCached(apiKey: string): Promise<GtfsStaticDat
   if (cache && Date.now() - cachedAt < CACHE_TTL) return cache;
 
   const url = `https://api-public.odpt.org/api/v4/gtfs/static/odpt_SendaiMunicipal_bus?acl:consumerKey=${apiKey}`;
-  const res = await fetch(url, { cache: 'no-store' });
+
+  // 8秒タイムアウト
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  let res: Response;
+  try {
+    res = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+  } finally {
+    clearTimeout(timer);
+  }
   if (!res.ok) throw new Error(`GTFS static: ${res.status} ${res.statusText}`);
 
   const zip = await JSZip.loadAsync(await res.arrayBuffer());
