@@ -30,23 +30,35 @@ function deadReckon(lat: number, lng: number, bear: number, spd: number, t: numb
 }
 
 // ── route colour & name ───────────────────────────────────────────────────
-function routeHue(routeId?: string) {
-  if (!routeId) return 210;
-  return Math.abs(routeId.split('').reduce((a, c) => a + c.charCodeAt(0), 0)) % 360;
+
+// Extract the short route number from a raw ID.
+// "odpt.Route:SendaiMunicipal.10" → "10"
+// "10"                            → "10"
+// "odpt.Trip:SendaiMunicipal.10.outbound.1" → "10" (first numeric-looking segment)
+function extractRouteNum(id?: string): string {
+  if (!id) return '';
+  // Try splitting on . or : and find a short (≤6 char) non-empty segment that looks like a route number
+  const parts = id.split(/[.:]/);
+  // Prefer a segment that is purely numeric or alphanumeric and short
+  const candidate = parts.slice().reverse().find(p => p && p.length <= 6 && /^[A-Za-z0-9-]+$/.test(p));
+  return candidate ?? parts[parts.length - 1] ?? id;
 }
 
-// Extract a short display label from the raw routeId string.
-// e.g. "odpt.Route:SendaiMunicipal.10" → "10系統"
-//      "10"                            → "10系統"
+function routeHue(routeId?: string, tripId?: string): number {
+  // Use routeId first; fall back to the route-number part extracted from tripId
+  const key = routeId ? extractRouteNum(routeId) : extractRouteNum(tripId);
+  if (!key) return 210;
+  return Math.abs(key.split('').reduce((a, c) => a + c.charCodeAt(0), 0)) % 360;
+}
+
 function routeLabel(routeId?: string): string {
   if (!routeId) return '-';
-  const last = routeId.split(/[.:]/).pop() ?? routeId;
-  return `${last}系統`;
+  return `${extractRouteNum(routeId)}系統`;
 }
 
 // ── bus icon ─────────────────────────────────────────────────────────────
-function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: string) {
-  const h = routeHue(routeId);
+function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: string, tripId?: string) {
+  const h = routeHue(routeId, tripId);
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
     <defs><filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
       <feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.35"/>
@@ -70,7 +82,7 @@ function formatTime(ts?: number) {
 }
 
 function buildBusPopup(bus: BusVehicle): string {
-  const h = routeHue(bus.routeId);
+  const h = routeHue(bus.routeId, bus.tripId);
   const rows: [string, string][] = [
     ['車両', bus.vehicleLabel ?? bus.id],
     ['路線', routeLabel(bus.routeId)],
@@ -98,7 +110,7 @@ interface LerpTask {
 }
 interface DrAnchor {
   lat: number; lng: number; bearingDeg: number; speedMs: number;
-  time: number; routeId?: string;
+  time: number; routeId?: string; tripId?: string;
 }
 interface FetchResult { vehicles: BusVehicle[]; count: number; fetchedAt: number; error?: string; }
 
@@ -112,7 +124,7 @@ export default function BusMap() {
   const lerpRef      = useRef<Map<string, LerpTask>>(new Map());
   const drRef        = useRef<Map<string, DrAnchor>>(new Map());
   const rafRef       = useRef<number | null>(null);
-  const drEnabledRef = useRef(true);
+  const drEnabledRef = useRef(false);
   const countdownRef = useRef(REFRESH_INTERVAL);
   const timerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -121,7 +133,7 @@ export default function BusMap() {
   const [lastUpdate,    setLastUpdate]    = useState('');
   const [errorMsg,      setErrorMsg]      = useState('');
   const [countdown,     setCountdown]     = useState(REFRESH_INTERVAL);
-  const [drEnabled,     setDrEnabled]     = useState(true);
+  const [drEnabled,     setDrEnabled]     = useState(false);
   const [alerts,        setAlerts]        = useState<ServiceAlert[]>([]);
   const [dismissAlerts, setDismissAlerts] = useState(false);
 
@@ -140,7 +152,8 @@ export default function BusMap() {
           marker.setLatLng([lerp(task.fromLat, task.toLat, e), lerp(task.fromLng, task.toLng, e)]);
           const bearing = lerpAngle(task.fromBearing, task.toBearing, e);
           bearingsRef.current.set(id, bearing);
-          marker.setIcon(getBusIcon(L, bearing, drRef.current.get(id)?.routeId));
+          const dr = drRef.current.get(id);
+          marker.setIcon(getBusIcon(L, bearing, dr?.routeId, dr?.tripId));
         }
         if (t < 1) { active = true; }
         else {
@@ -189,7 +202,7 @@ export default function BusMap() {
           const fromBearing = bearingsRef.current.get(bus.id) ?? newBearing;
           drRef.current.set(bus.id, {
             lat: bus.lat, lng: bus.lon, bearingDeg: newBearing,
-            speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId,
+            speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId, tripId: bus.tripId,
           });
           lerpRef.current.set(bus.id, {
             fromLat: cur.lat, fromLng: cur.lng, toLat: bus.lat, toLng: bus.lon,
@@ -198,7 +211,7 @@ export default function BusMap() {
           existingIds.delete(bus.id);
           startRaf();
         } else {
-          const icon = getBusIcon(lf, newBearing, bus.routeId);
+          const icon = getBusIcon(lf, newBearing, bus.routeId, bus.tripId);
           const marker = lf.marker([bus.lat, bus.lon], { icon })
             .bindPopup(() => buildBusPopup(busDataRef.current.get(bus.id) ?? bus), { maxWidth: 260 })
             .addTo(mapRef.current!);
@@ -206,7 +219,7 @@ export default function BusMap() {
           bearingsRef.current.set(bus.id, newBearing);
           drRef.current.set(bus.id, {
             lat: bus.lat, lng: bus.lon, bearingDeg: newBearing,
-            speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId,
+            speedMs: newSpeedMs, time: performance.now(), routeId: bus.routeId, tripId: bus.tripId,
           });
           if (newSpeedMs > 0) startRaf();
         }
