@@ -34,32 +34,40 @@ function deadReckon(lat: number, lng: number, bear: number, spd: number, t: numb
 // Extract the short route number from a raw ID.
 // tripId format:  "10_1_1100029012:56:0020260414" → "10"
 // routeId format: "odpt.Route:SendaiMunicipal.10" → "10"
-// bare:           "10"                            → "10"
 function extractRouteNum(id?: string): string {
   if (!id) return '';
-  // Pattern: "{route}_1_..." — route number is the first underscore segment
   const firstSeg = id.split('_')[0];
   if (/^\d{1,3}$/.test(firstSeg)) return firstSeg;
-  // Fallback: last segment after . or :
   const parts = id.split(/[.:]/);
   return parts[parts.length - 1] ?? id;
 }
 
 function routeHue(routeId?: string, tripId?: string): number {
-  // Use routeId first; fall back to the route-number part extracted from tripId
   const key = routeId ? extractRouteNum(routeId) : extractRouteNum(tripId);
   if (!key) return 210;
   return Math.abs(key.split('').reduce((a, c) => a + c.charCodeAt(0), 0)) % 360;
 }
 
-function routeLabel(routeId?: string): string {
-  if (!routeId) return '-';
-  return `${extractRouteNum(routeId)}系統`;
+function routeLabel(routeId?: string, tripId?: string): string {
+  const num = routeId ? extractRouteNum(routeId) : extractRouteNum(tripId);
+  return num ? `${num}系統` : '-';
 }
 
 // ── bus icon ─────────────────────────────────────────────────────────────
-function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: string, tripId?: string) {
+function getBusIcon(
+  lf: typeof import('leaflet'),
+  bearing: number,
+  routeId?: string,
+  tripId?: string,
+  delay = 0,
+) {
   const h = routeHue(routeId, tripId);
+  // Delay indicator dot at top-right corner of the 32×32 icon
+  const delayDot = delay >= 180
+    ? `<circle cx="26" cy="6" r="5" fill="#ef4444" stroke="white" stroke-width="1.5"/>`
+    : delay >= 60
+    ? `<circle cx="26" cy="6" r="5" fill="#f59e0b" stroke="white" stroke-width="1.5"/>`
+    : '';
   const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
     <defs><filter id="sh" x="-30%" y="-30%" width="160%" height="160%">
       <feDropShadow dx="0" dy="2" stdDeviation="2" flood-opacity="0.35"/>
@@ -72,36 +80,18 @@ function getBusIcon(lf: typeof import('leaflet'), bearing: number, routeId?: str
     <rect x="17" y="13" width="5" height="3.5" rx="1" fill="white" opacity="0.95"/>
     <rect x="9" y="23" width="3.5" height="2.5" rx="1" fill="hsl(${h},60%,28%)"/>
     <rect x="19.5" y="23" width="3.5" height="2.5" rx="1" fill="hsl(${h},60%,28%)"/>
+    ${delayDot}
   </svg>`;
   return lf.divIcon({ html: svg, className: '', iconSize: [32, 32], iconAnchor: [16, 16], popupAnchor: [0, -18] });
 }
 
-// ── popup ─────────────────────────────────────────────────────────────────
+// ── time formatting ───────────────────────────────────────────────────────
 function formatTime(ts?: number) {
   if (!ts) return '-';
   return new Date(ts).toLocaleTimeString('ja-JP');
 }
-
-function buildBusPopup(bus: BusVehicle): string {
-  const h = routeHue(bus.routeId, bus.tripId);
-  const rows: [string, string][] = [
-    ['車両', bus.vehicleLabel ?? bus.id],
-    ['路線', routeLabel(bus.routeId)],
-    ['速度', bus.speed != null ? `${bus.speed} km/h` : '-'],
-    ['状態', bus.currentStatus ?? '-'],
-    ['更新', formatTime(bus.timestamp)],
-  ];
-  const rowsHtml = rows.map(([l, v]) =>
-    `<tr>
-      <td style="color:#6b7280;padding:2px 10px 2px 0;font-size:11px;white-space:nowrap">${l}</td>
-      <td style="color:#111827;padding:2px 0;font-size:11px;font-weight:600">${v}</td>
-    </tr>`
-  ).join('');
-  return `<div style="background:#fff;border-radius:8px;padding:10px 13px;min-width:180px;
-    font-family:system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.15)">
-    <div style="font-weight:700;font-size:13px;margin-bottom:7px;color:hsl(${h},65%,40%)">🚌 バス情報</div>
-    <table style="border-collapse:collapse;width:100%">${rowsHtml}</table>
-  </div>`;
+function formatHM(ts: number) {
+  return new Date(ts).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
 }
 
 // ── internal types ────────────────────────────────────────────────────────
@@ -115,19 +105,29 @@ interface DrAnchor {
 }
 interface FetchResult { vehicles: BusVehicle[]; count: number; fetchedAt: number; error?: string; }
 
+interface TripStop {
+  stopId:      string;
+  arrivalTime: number;
+  delay:       number;
+  isTerminal:  boolean;
+}
+interface SelectedBus { bus: BusVehicle; stops: TripStop[] | null; error?: string; }
+
 // ── component ─────────────────────────────────────────────────────────────
 export default function BusMap() {
-  const mapRef       = useRef<import('leaflet').Map | null>(null);
-  const markersRef   = useRef<Map<string, import('leaflet').Marker>>(new Map());
-  const bearingsRef  = useRef<Map<string, number>>(new Map());
-  const busDataRef   = useRef<Map<string, BusVehicle>>(new Map());
-  const containerRef = useRef<HTMLDivElement>(null);
-  const lerpRef      = useRef<Map<string, LerpTask>>(new Map());
-  const drRef        = useRef<Map<string, DrAnchor>>(new Map());
-  const rafRef       = useRef<number | null>(null);
-  const drEnabledRef = useRef(false);
-  const countdownRef = useRef(REFRESH_INTERVAL);
-  const timerRef     = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const mapRef        = useRef<import('leaflet').Map | null>(null);
+  const markersRef    = useRef<Map<string, import('leaflet').Marker>>(new Map());
+  const bearingsRef   = useRef<Map<string, number>>(new Map());
+  const busDataRef    = useRef<Map<string, BusVehicle>>(new Map());
+  const containerRef  = useRef<HTMLDivElement>(null);
+  const lerpRef       = useRef<Map<string, LerpTask>>(new Map());
+  const drRef         = useRef<Map<string, DrAnchor>>(new Map());
+  const rafRef        = useRef<number | null>(null);
+  const drEnabledRef  = useRef(false);
+  const countdownRef  = useRef(REFRESH_INTERVAL);
+  const timerRef      = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const delayMapRef   = useRef<Record<string, number>>({});
+  const selBusIdRef   = useRef<string | null>(null);
 
   const [status,        setStatus]        = useState<'loading' | 'ok' | 'error'>('loading');
   const [busCount,      setBusCount]      = useState(0);
@@ -137,6 +137,7 @@ export default function BusMap() {
   const [drEnabled,     setDrEnabled]     = useState(false);
   const [alerts,        setAlerts]        = useState<ServiceAlert[]>([]);
   const [dismissAlerts, setDismissAlerts] = useState(false);
+  const [selectedBus,   setSelectedBus]   = useState<SelectedBus | null>(null);
 
   // ── RAF loop ──────────────────────────────────────────────────────────
   const startRaf = useCallback(() => {
@@ -153,8 +154,9 @@ export default function BusMap() {
           marker.setLatLng([lerp(task.fromLat, task.toLat, e), lerp(task.fromLng, task.toLng, e)]);
           const bearing = lerpAngle(task.fromBearing, task.toBearing, e);
           bearingsRef.current.set(id, bearing);
-          const dr = drRef.current.get(id);
-          marker.setIcon(getBusIcon(L, bearing, dr?.routeId, dr?.tripId));
+          const dr    = drRef.current.get(id);
+          const delay = delayMapRef.current[dr?.tripId ?? ''] ?? 0;
+          marker.setIcon(getBusIcon(L, bearing, dr?.routeId, dr?.tripId, delay));
         }
         if (t < 1) { active = true; }
         else {
@@ -181,20 +183,54 @@ export default function BusMap() {
     rafRef.current = requestAnimationFrame(loop);
   }, []);
 
+  // ── fetch trip stops (for click panel) ───────────────────────────────
+  const fetchTripStops = useCallback(async (bus: BusVehicle) => {
+    selBusIdRef.current = bus.id;
+    setSelectedBus({ bus, stops: null });
+
+    if (!bus.tripId) {
+      setSelectedBus({ bus, stops: [], error: 'tripId なし' });
+      return;
+    }
+
+    try {
+      const res  = await fetch(`/api/trip-stops?tripId=${encodeURIComponent(bus.tripId)}`);
+      const data: { stops?: TripStop[]; error?: string } = await res.json();
+      if (selBusIdRef.current !== bus.id) return; // superseded by newer click
+      if (data.error) {
+        setSelectedBus({ bus, stops: [], error: data.error });
+      } else {
+        setSelectedBus({ bus, stops: data.stops ?? [] });
+      }
+    } catch {
+      if (selBusIdRef.current !== bus.id) return;
+      setSelectedBus({ bus, stops: [], error: 'ネットワークエラー' });
+    }
+  }, []);
+
   // ── fetch buses ───────────────────────────────────────────────────────
   const fetchBuses = useCallback(async () => {
     if (!mapRef.current || !L) return;
     try {
-      const res  = await fetch('/api/buses', { cache: 'no-store' });
-      const data: FetchResult = await res.json();
-      if (!res.ok || data.error) { setStatus('error'); setErrorMsg(data.error ?? 'エラー'); return; }
+      const [busRes, delayRes] = await Promise.all([
+        fetch('/api/buses',       { cache: 'no-store' }),
+        fetch('/api/trip-delays', { cache: 'no-store' }).catch(() => null),
+      ]);
+      const data: FetchResult = await busRes.json();
+      if (!busRes.ok || data.error) { setStatus('error'); setErrorMsg(data.error ?? 'エラー'); return; }
 
-      const lf = L;
+      if (delayRes?.ok) {
+        const dd = await delayRes.json().catch(() => null);
+        if (dd?.delays) delayMapRef.current = dd.delays;
+      }
+
+      const lf          = L;
       const existingIds = new Set(markersRef.current.keys());
 
       for (const bus of data.vehicles) {
         const newBearing = bus.bearing  ?? 0;
         const newSpeedMs = (bus.speed ?? 0) / 3.6;
+        const delay      = delayMapRef.current[bus.tripId ?? ''] ?? 0;
         busDataRef.current.set(bus.id, bus);
 
         if (markersRef.current.has(bus.id)) {
@@ -209,12 +245,16 @@ export default function BusMap() {
             fromLat: cur.lat, fromLng: cur.lng, toLat: bus.lat, toLng: bus.lon,
             fromBearing, toBearing: newBearing, startTime: performance.now(),
           });
+          // Update icon immediately to reflect new delay color
+          marker.setIcon(getBusIcon(lf, fromBearing, bus.routeId, bus.tripId, delay));
           existingIds.delete(bus.id);
           startRaf();
         } else {
-          const icon = getBusIcon(lf, newBearing, bus.routeId, bus.tripId);
+          const icon   = getBusIcon(lf, newBearing, bus.routeId, bus.tripId, delay);
           const marker = lf.marker([bus.lat, bus.lon], { icon })
-            .bindPopup(() => buildBusPopup(busDataRef.current.get(bus.id) ?? bus), { maxWidth: 260 })
+            .on('click', () => {
+              fetchTripStops(busDataRef.current.get(bus.id) ?? bus);
+            })
             .addTo(mapRef.current!);
           markersRef.current.set(bus.id, marker);
           bearingsRef.current.set(bus.id, newBearing);
@@ -233,6 +273,11 @@ export default function BusMap() {
         busDataRef.current.delete(oldId);
         lerpRef.current.delete(oldId);
         drRef.current.delete(oldId);
+        // Close panel if the selected bus has left the feed
+        if (selBusIdRef.current === oldId) {
+          setSelectedBus(null);
+          selBusIdRef.current = null;
+        }
       }
 
       setBusCount(data.count);
@@ -243,7 +288,7 @@ export default function BusMap() {
       setStatus('error');
       setErrorMsg(e instanceof Error ? e.message : 'ネットワークエラー');
     }
-  }, [startRaf]);
+  }, [startRaf, fetchTripStops]);
 
   // ── fetch alerts ──────────────────────────────────────────────────────
   const fetchAlerts = useCallback(async () => {
@@ -315,6 +360,11 @@ export default function BusMap() {
     }
   };
 
+  const closePanel = () => {
+    setSelectedBus(null);
+    selBusIdRef.current = null;
+  };
+
   const alertOffset = alerts.length > 0 && !dismissAlerts;
 
   // ── render ────────────────────────────────────────────────────────────
@@ -373,6 +423,93 @@ export default function BusMap() {
           )}
         </div>
       </div>
+
+      {/* bus detail panel */}
+      {selectedBus && (
+        <div className="absolute bottom-6 left-3 z-[1100]
+                        bg-white/96 backdrop-blur-sm rounded-xl shadow-xl
+                        border border-gray-200 w-64 flex flex-col overflow-hidden
+                        max-h-[calc(100%-80px)]">
+          {/* panel header */}
+          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100"
+               style={{ borderLeft: `3px solid hsl(${routeHue(selectedBus.bus.routeId, selectedBus.bus.tripId)},72%,48%)` }}>
+            <div className="min-w-0">
+              <div className="font-bold text-sm text-gray-900">
+                {routeLabel(selectedBus.bus.routeId, selectedBus.bus.tripId)}
+              </div>
+              <div className="text-xs text-gray-400 truncate">
+                {selectedBus.bus.vehicleLabel ?? selectedBus.bus.id}
+                {selectedBus.bus.currentStatus && ` · ${selectedBus.bus.currentStatus}`}
+              </div>
+            </div>
+            <button onClick={closePanel}
+              className="ml-2 flex-shrink-0 text-gray-400 hover:text-gray-600 text-lg leading-none"
+              aria-label="閉じる">✕</button>
+          </div>
+
+          {/* stops list */}
+          <div className="overflow-y-auto flex-1 py-1">
+            {selectedBus.stops === null && (
+              <div className="flex items-center justify-center gap-2 py-6 text-sm text-gray-400">
+                <svg className="animate-spin h-4 w-4" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"/>
+                </svg>
+                読み込み中...
+              </div>
+            )}
+            {selectedBus.stops !== null && selectedBus.stops.length === 0 && (
+              <div className="text-center py-6 text-xs text-gray-400">
+                {selectedBus.error ?? '停車予定なし'}
+              </div>
+            )}
+            {selectedBus.stops !== null && selectedBus.stops.length > 0 && (
+              <table className="w-full text-xs">
+                <tbody>
+                  {selectedBus.stops.map((stop, i) => (
+                    <tr key={`${stop.stopId}-${i}`}
+                        className={`border-b border-gray-50 last:border-0
+                                    ${stop.isTerminal ? 'bg-blue-50/70' : 'hover:bg-gray-50'}`}>
+                      <td className="pl-3 pr-1 py-1.5 text-gray-300 w-5 text-right tabular-nums">{i + 1}</td>
+                      <td className="px-2 py-1.5 font-mono font-semibold text-gray-800 whitespace-nowrap tabular-nums">
+                        {formatHM(stop.arrivalTime)}
+                      </td>
+                      <td className="px-1 py-1.5 text-gray-400 text-[11px]">
+                        {stop.isTerminal && <span className="text-blue-500 font-medium mr-0.5">終点</span>}
+                        #{stop.stopId.split('_')[0]}
+                      </td>
+                      <td className="pr-3 py-1.5 text-right whitespace-nowrap tabular-nums">
+                        {stop.delay >= 180 ? (
+                          <span className="text-red-500 font-medium">+{Math.round(stop.delay / 60)}分</span>
+                        ) : stop.delay >= 60 ? (
+                          <span className="text-amber-500 font-medium">+{Math.round(stop.delay / 60)}分</span>
+                        ) : stop.delay <= -60 ? (
+                          <span className="text-sky-500 font-medium">{Math.round(stop.delay / 60)}分</span>
+                        ) : (
+                          <span className="text-green-600">定刻</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          {/* legend */}
+          <div className="px-4 py-2 border-t border-gray-100 flex gap-3 text-[10px] text-gray-400">
+            <span className="flex items-center gap-1">
+              <span className="inline-block w-2 h-2 rounded-full bg-red-500"/>3分超
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block w-2 h-2 rounded-full bg-amber-400"/>1〜3分
+            </span>
+            <span className="flex items-center gap-1">
+              <span className="inline-block w-2 h-2 rounded-full bg-green-500"/>定刻
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* controls */}
       <div className="absolute bottom-6 right-3 z-[1000] flex flex-col gap-2 items-end">
